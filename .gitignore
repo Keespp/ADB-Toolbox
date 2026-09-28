@@ -1,0 +1,13 @@
+build/
+dist/
+*.spec
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+registros/
+*.tgz
+*.apk
+*.mp4
