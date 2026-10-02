@@ -121,6 +121,114 @@ def correr():
     b["Desinstalar"].invoke()
     r.check(elegidos == ["com.dos"], "y la acción se hace sobre la elegida")
 
+    estado = {"admin": True}
+    DP = ("Current Device Policy Manager state:\n"
+          "  \n  \n  \n"
+          "  Enabled Device Admins (User 0, provisioningState: 0):\n"
+          "    com.admin.app/.mdmcliente.AdminReceiver:\n"
+          "      uid=10089\n"
+          "      testOnlyAdmin=false\n")
+
+    def resp_admin(args):
+        if args[:1] == ["uninstall"]:
+            if estado["admin"]:
+                return 0, "Failure [DELETE_FAILED_DEVICE_POLICY_MANAGER]\n", ""
+            return 0, "Success\n", ""
+        if args[:3] == ["exec-out", "dumpsys", "device_policy"]:
+            return 0, DP, ""
+        if args[:3] == ["exec-out", "dpm", "remove-active-admin"]:
+            estado["admin"] = False
+            return 0, "Success: Admin com.admin.app removed\n", ""
+        return None
+
+    adb2 = poner_adb(app, resp_admin)
+    app.salida = []
+    app._do_uninstall("com.admin.app")
+    r.check(adb2.se_mando("dpm remove-active-admin com.admin.app/.mdmcliente.AdminReceiver"),
+            "el admin sale de device_policy aunque venga 'pelado' (sin ComponentInfo{})")
+    r.check(any("Desinstalada: com.admin.app" in m for m in app.salida),
+            "y tras quitarlo, el reintento de desinstalación termina bien")
+    dichos = adb2.dichos()
+    i_dpm = next(k for k, d in enumerate(dichos) if "remove-active-admin" in d)
+    i_uni2 = max(k for k, d in enumerate(dichos) if d.startswith("uninstall"))
+    r.check(i_uni2 > i_dpm, "el reintento va después de quitar el admin, no antes")
+
+    estado_fb = {"admin": True}
+    PKG_DUMP = ("Receiver Resolver Table:\n"
+                "  Non-Data Actions:\n"
+                "      android.app.action.DEVICE_ADMIN_ENABLED:\n"
+                "        9186131 com.fb.app/.mdmcliente.AdminReceiver filter 9e48016\n"
+                "          Action: \"android.app.action.DEVICE_ADMIN_ENABLED\"\n")
+
+    def resp_fb(args):
+        if args[:1] == ["uninstall"]:
+            if estado_fb["admin"]:
+                return 0, "Failure [DELETE_FAILED_DEVICE_POLICY_MANAGER]\n", ""
+            return 0, "Success\n", ""
+        if args[:3] == ["exec-out", "dumpsys", "device_policy"]:
+            return 0, "Current Device Policy Manager state:\n", ""
+        if args[:3] == ["exec-out", "dumpsys", "package"]:
+            return 0, PKG_DUMP, ""
+        if args[:3] == ["exec-out", "dpm", "remove-active-admin"]:
+            estado_fb["admin"] = False
+            return 0, "Success\n", ""
+        return None
+
+    adb_fb = poner_adb(app, resp_fb)
+    app.salida = []
+    app._do_uninstall("com.fb.app")
+    r.check(adb_fb.se_mando("dpm remove-active-admin com.fb.app/.mdmcliente.AdminReceiver"),
+            "si device_policy no lo lista, el componente se saca del manifiesto del paquete")
+    r.check(any("Desinstalada: com.fb.app" in m for m in app.salida),
+            "y con ese respaldo la desinstalación termina bien")
+
+    def resp_no_admin(args):
+        if args[:1] == ["uninstall"]:
+            return 0, "Failure [DELETE_FAILED_DEVICE_POLICY_MANAGER]\n", ""
+        if args[:3] == ["exec-out", "dumpsys", "device_policy"]:
+            return 0, "Current Device Policy Manager state:\n  (none)\n", ""
+        return None
+
+    adb3 = poner_adb(app, resp_no_admin)
+    app.salida = []
+    app._do_uninstall("com.otro.app")
+    r.check(not adb3.se_mando("remove-active-admin"),
+            "si no se halla el componente por ningún lado, no se lanza dpm a ciegas")
+    r.check(any("Seguridad" in m for m in app.salida),
+            "y se avisa de quitarlo a mano en Ajustes")
+
+    conexiones = []
+
+    def resp_conn(args):
+        if args[:1] == ["connect"]:
+            conexiones.append(args[1])
+            return 0, "connected to %s" % args[1], ""
+        return None
+
+    poner_adb(app, resp_conn)
+    app.salida = []
+    app._conectar_ips(["192.168.1.50", "192.168.1.51:5555"])
+    r.check(conexiones == ["192.168.1.50:5555", "192.168.1.51:5555"],
+            "conectar por red pone :5555 si falta y respeta el puerto si ya viene")
+    r.check(any("Conectados 2 de 2" in m for m in app.salida),
+            "y resume cuántas conexiones salieron bien")
+
+    app.device_map = {}
+    poner_adb(app, resp_conn)
+    del conexiones[:]
+    app._ventana_encontrados(["192.168.1.60"], 5555)
+    esperar(app, 200)
+    ventana = [w for w in app.winfo_children()
+               if isinstance(w, T.ctk.CTkToplevel)][-1]
+    bb = botones_de(ventana)
+    clave = next(k for k in bb if k.startswith("Conectar"))
+    r.check(clave == "Conectar (1)",
+            "la ventana de red muestra cuántos hay seleccionados")
+    bb[clave].invoke()
+    esperar(app, 100)
+    r.check("192.168.1.60:5555" in conexiones,
+            "al confirmar, se conecta a los dispositivos hallados")
+
     app.destroy()
     return r.resumen()
 

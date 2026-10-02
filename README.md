@@ -32,11 +32,11 @@ en este orden:
 | 📸 **Capturas** | Captura de pantalla (guarda en carpeta **y** copia al portapapeles), grabar pantalla con inicio/parada manual, espejar en tiempo real (scrcpy), abrir carpeta |
 | 📁 **Archivos** | Explorar el equipo, enviar (push), traer (pull), eliminar y **editar los XML en el sitio** — [ver abajo](#editar-un-xml-del-equipo) |
 | 🎮 **Control remoto** | D-pad y OK, atrás, inicio, menú, recientes, volumen, silencio, play/pausa, encendido, y un campo que escribe en el equipo lo que teclees en el PC |
-| 📦 **Aplicaciones** | Desinstalar APK, instalar APK, extraer el APK instalado, abrir una app, ver y cambiar sus permisos, **listar las apps con su versión** (solo las tuyas o todas, incluidas las del sistema), forzar detención, borrar datos |
+| 📦 **Aplicaciones** | Desinstalar APK (**incluidas las que son administrador de dispositivos**), instalar APK, extraer el APK instalado, abrir una app, ver y cambiar sus permisos, **listar las apps con su versión** (solo las tuyas o todas, incluidas las del sistema), forzar detención, borrar datos |
 | 📋 **Registros** | Extraer el logcat completo, el de una app concreta o sólo los errores; traer los registros que el equipo guarda en disco; generar el bugreport de Android; limpiar el buffer |
 | 🛠️ **Desarrollador** | Límites de diseño, overdraw GPU, mostrar toques, ubicación del puntero, animaciones, no mantener actividades, permanecer activo al cargar, perfil de renderizado GPU (todos alternables ON/OFF) |
 | ⚡ **Energía** | Reiniciar, recovery, bootloader, apagar, pantalla ON/OFF |
-| 🌐 **Red** | Habilitar ADB por WiFi (puerto 5555), conectar por IP, **emparejar por WiFi (Android 11+)** |
+| 🌐 **Red** | Habilitar ADB por WiFi (puerto 5555), conectar por IP, **buscar dispositivos en la red** (escanea tu LAN y los conecta de golpe), emparejar por WiFi (Android 11+) |
 | 📺 **TV Box** | Signage p291: fix completo, fecha y hora, resolución, diagnóstico, reiniciar la app — [ver abajo](#sección-tv-box-signage-p291) |
 
 ### Editar un XML del equipo
@@ -134,6 +134,35 @@ tarda unos segundos — la barra de progreso avisa de que está trabajando.
 
 **Listar TODAS** incluye las del sistema, que en una caja de señalización suelen ser
 cientos.
+
+## Buscar dispositivos en la red
+
+**Red → Buscar dispositivos en la red...** explora tu red local buscando equipos con
+ADB por WiFi escuchando (puerto **5555**, el que deja abierto `adb tcpip 5555` o el botón
+**Habilitar ADB por WiFi**). Es lo que sirve para las cajas de señalización p291, que son
+Android 9 y **no** aparecen por mDNS (eso es de Android 11+, y es lo que usa el emparejado).
+
+Detecta la red de cada interfaz del PC (las `IP.0/24` que va a escanear se ven en la
+consola) y sondea las 254 direcciones de cada una en paralelo, en **dos pasadas** (la
+segunda rescata los equipos cuyo intento se perdió en la primera). Una sola subred tarda
+unos segundos. Al terminar sale una ventana con los que encontró — los ya conectados vienen
+marcados —; eliges cuáles y **los conecta todos de una** (`adb connect IP:5555`). Útil para
+enchufar una flota entera sin ir IP por IP.
+
+Por WiFi, hotspot o VPN un equipo puede tardar en responder; el sondeo espera **1,5 s** por
+dirección. Si tus equipos siguen sin salir aunque estén encendidos y en la red, sube el
+tiempo de espera en `config.json`:
+
+```json
+{ "scan_timeout": 3, "scan_workers": 256, "scan_pasadas": 2 }
+```
+
+- `scan_timeout` — segundos de espera por dirección (súbelo si tu red es lenta).
+- `scan_workers` — cuántas direcciones sondea a la vez.
+- `scan_pasadas` — número de barridos (más pasadas, más fiable pero más lento).
+
+Sólo busca en la misma subred `/24` de cada interfaz del PC. Si tus equipos están en otra
+red distinta, usa **Conectar por IP...**.
 
 ## Emparejar por WiFi (Android 11 o superior)
 
@@ -344,6 +373,11 @@ El resultado queda en `dist\ADB_Toolbox.exe`.
 ## Notas
 
 - Los comandos destructivos (desinstalar, borrar datos, apagar, reiniciar) piden **confirmación**.
+- Si una app es **administrador de dispositivos**, la desinstalación normal falla
+  (`DELETE_FAILED_DEVICE_POLICY_MANAGER`). En ese caso se le quita el permiso de
+  administrador (`dpm remove-active-admin`) y se reintenta, avisando en la consola. Si la
+  app es **propietario del dispositivo** (device owner), no se puede quitar por adb y se
+  informa de ello.
 - Cada comando se ejecuta en segundo plano; la interfaz no se congela.
 - Copiar la captura al portapapeles usa el formato nativo de Windows (CF_DIB), así que puedes
   pegarla directamente en Paint, Word, chats, etc.

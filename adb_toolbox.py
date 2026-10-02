@@ -6,11 +6,13 @@ import json
 import time
 import shlex
 import shutil
+import socket
 import tempfile
 import threading
 import subprocess
 import datetime
 import posixpath
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -650,6 +652,7 @@ class ADBToolbox(ctk.CTk):
                 ("wifi", "Red / WiFi", [
                     ("Habilitar ADB por WiFi (5555)", self.action_wifi_enable, A),
                     ("Conectar por IP...", self.action_wifi_connect, A),
+                    ("Buscar dispositivos en la red...", self.action_wifi_scan, A),
                     ("Emparejar por WiFi (Android 11+)...", self.action_wifi_pair, GR),
                 ]),
                 ("tv", "TV Box", "tvbox"),
@@ -2833,8 +2836,58 @@ class ADBToolbox(ctk.CTk):
         code, out, err = self.run_adb(["uninstall", pkg], timeout=60)
         if "Success" in out:
             self.log(f"✓ Desinstalada: {pkg}")
+            return
+        salida = (out or err).strip()
+        if "DEVICE_POLICY" not in salida.upper():
+            self.log(f"✗ Error al desinstalar {pkg}: {salida}")
+            return
+        self.log(f"⚠ {pkg} es administrador de dispositivos; quitando el permiso…")
+        comps = self._admin_components(pkg)
+        if not comps:
+            self.log(f"✗ No se encontró el componente de administrador de {pkg}. "
+                     f"Quítalo a mano en Ajustes › Seguridad › Administradores.")
+            return
+        for comp in comps:
+            c, o, e = self.run_adb(
+                ["exec-out", "dpm", "remove-active-admin", comp], timeout=30)
+            salida_dpm = (o or e).strip()
+            if "Success" in o or "removed" in salida_dpm.lower():
+                self.log(f"  ✓ Administrador desactivado: {comp}")
+            else:
+                self.log(f"  ✗ No se pudo desactivar {comp}: {salida_dpm}")
+                if "owner" in salida_dpm.lower():
+                    self.log(f"    ({pkg} es propietario del dispositivo; no se "
+                             f"puede quitar por adb.)")
+        code, out, err = self.run_adb(["uninstall", pkg], timeout=60)
+        if "Success" in out:
+            self.log(f"✓ Desinstalada: {pkg}")
         else:
             self.log(f"✗ Error al desinstalar {pkg}: {(out or err).strip()}")
+
+    def _admin_components(self, pkg):
+        comps = []
+
+        def apuntar(comp):
+            comp = comp.rstrip(":")
+            if comp not in comps:
+                comps.append(comp)
+
+        code, out, err = self.run_adb(["exec-out", "dumpsys", "device_policy"])
+        for m in re.finditer(re.escape(pkg) + r"/[\w.$]+", out):
+            apuntar(m.group(0))
+        if comps:
+            return comps
+
+        code, out, err = self.run_adb(["exec-out", "dumpsys", "package", pkg])
+        lineas = out.splitlines()
+        for i, linea in enumerate(lineas):
+            if linea.strip().endswith("DEVICE_ADMIN_ENABLED:"):
+                for sig in lineas[i + 1:i + 4]:
+                    m = re.search(re.escape(pkg) + r"/[\w.$]+", sig)
+                    if m:
+                        apuntar(m.group(0))
+                        break
+        return comps
 
     def action_force_stop(self):
         if not (self.ensure_adb() and self.ensure_device()):
@@ -2932,6 +2985,182 @@ class ADBToolbox(ctk.CTk):
             self.log((out or err).strip())
             self.after(300, self.refresh_devices)
         self.threaded(_w)
+
+    def action_wifi_scan(self):
+        if not self.ensure_adb():
+            return
+        self.threaded(self._scan_worker)
+
+    def _scan_worker(self, port=5555):
+        bases = self._bases_de_red()
+        if not bases:
+            self.log("✗ No pude determinar la red local. Conéctate por IP a mano.")
+            return
+        timeout = float(self.cfg.get("scan_timeout", 1.5))
+        workers = int(self.cfg.get("scan_workers", 256))
+        pasadas = int(self.cfg.get("scan_pasadas", 2))
+        self.log("Buscando dispositivos con ADB por WiFi (puerto %d) en %s "
+                 "[timeout %.1fs, %d pasadas] ..."
+                 % (port, ", ".join(b + ".0/24" for b in bases), timeout, pasadas))
+        encontrados = self._escanear_red(bases, port, timeout, workers, pasadas)
+        if not encontrados:
+            self.log("No se encontró ningún equipo con ADB por WiFi. Comprueba que "
+                     "el equipo tiene «Habilitar ADB por WiFi (5555)», está en esta "
+                     "misma red y no está en reposo. Si tarda en responder, sube "
+                     "«scan_timeout» en config.json (p. ej. 3).")
+            return
+        self.log("✓ %d con el puerto %d abierto: %s"
+                 % (len(encontrados), port, ", ".join(encontrados)))
+        self.after(0, lambda: self._ventana_encontrados(encontrados, port))
+
+    def _bases_de_red(self):
+        ips = set()
+        try:
+            for res in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ips.add(res[4][0])
+        except Exception:
+            pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ips.add(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+        bases = []
+        for ip in ips:
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            base = ".".join(ip.split(".")[:3])
+            if base not in bases:
+                bases.append(base)
+        return bases
+
+    def _escanear_red(self, bases, port=5555, timeout=1.5, workers=256,
+                      pasadas=2):
+        objetivos = ["%s.%d" % (b, h) for b in bases for h in range(1, 255)]
+        encontrados = []
+        pendientes = objetivos
+        pasadas = max(1, pasadas)
+        self._progress_show("Explorando la red...")
+        self._progress_determinado()
+        for n in range(pasadas):
+            if not pendientes:
+                break
+            nuevos = self._barrido(pendientes, port, timeout, workers,
+                                   n / pasadas, 1.0 / pasadas)
+            encontrados.extend(nuevos)
+            hallados = set(encontrados)
+            pendientes = [ip for ip in pendientes if ip not in hallados]
+        self._progress_hide()
+        return sorted(encontrados, key=lambda s: [int(x) for x in s.split(".")])
+
+    def _barrido(self, objetivos, port, timeout, workers, base_frac, paso_frac):
+        total = len(objetivos)
+        hall = []
+        hechos = [0]
+        lock = threading.Lock()
+
+        def sondear(ip):
+            try:
+                with socket.create_connection((ip, port), timeout=timeout):
+                    abierto = True
+            except Exception:
+                abierto = False
+            with lock:
+                hechos[0] += 1
+                if abierto:
+                    hall.append(ip)
+                if hechos[0] % 8 == 0 or hechos[0] == total:
+                    self._progress_set(base_frac + paso_frac * hechos[0] / total)
+            return abierto
+
+        with ThreadPoolExecutor(max_workers=min(workers, total)) as ex:
+            list(ex.map(sondear, objetivos))
+        return hall
+
+    def _conectar_ips(self, ips, port=5555):
+        ok = 0
+        for ip in ips:
+            destino = ip if ":" in ip else "%s:%d" % (ip, port)
+            _, out, err = self.run_adb(["connect", destino], target_device=False,
+                                       timeout=25)
+            salida = (out or err).strip()
+            self.log("  " + (salida or "sin respuesta"))
+            if "connected" in salida.lower():
+                ok += 1
+        self.log("✓ Conectados %d de %d." % (ok, len(ips)))
+        self.after(300, self.refresh_devices)
+
+    def _ventana_encontrados(self, ips, port=5555):
+        conectados = {s.split(":")[0] for s in (self.device_map or {}).values() if s}
+        win = ctk.CTkToplevel(self)
+        win.title("Dispositivos en la red")
+        win.geometry("440x460")
+        win.configure(fg_color=COLOR_BG)
+        win.transient(self)
+        self._cromo_windows(win)
+        win.grab_set()
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(win, text="Dispositivos con ADB por WiFi",
+                     font=ctk.CTkFont(size=16, weight="bold")
+                     ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
+
+        listframe = ctk.CTkScrollableFrame(win, fg_color=COLOR_CARD)
+        listframe.grid(row=1, column=0, sticky="nsew", padx=16, pady=6)
+        listframe.grid_columnconfigure(0, weight=1)
+
+        seleccion = {ip: True for ip in ips}
+        filas = {}
+
+        def pintar(ip):
+            activa = seleccion[ip]
+            filas[ip].configure(
+                fg_color=COLOR_ACCENT if activa else "transparent",
+                hover_color=COLOR_ACCENT_HOVER if activa else COLOR_RAISED,
+                text_color="#ffffff" if activa else COLOR_TEXT)
+
+        def alternar(ip):
+            seleccion[ip] = not seleccion[ip]
+            pintar(ip)
+            refrescar_boton()
+
+        for ip in ips:
+            ya = ip in conectados
+            etiqueta = ip + (":%d" % port) + ("   · ya conectado" if ya else "")
+            b = ctk.CTkButton(listframe, text=etiqueta, anchor="w", height=30,
+                              command=lambda p=ip: alternar(p))
+            b.grid(sticky="ew", pady=1)
+            filas[ip] = b
+            pintar(ip)
+
+        btnbar = ctk.CTkFrame(win, fg_color="transparent")
+        btnbar.grid(row=2, column=0, sticky="ew", padx=16, pady=12)
+        btnbar.grid_columnconfigure(0, weight=1)
+
+        def refrescar_boton():
+            n = sum(1 for v in seleccion.values() if v)
+            conectar.configure(text="Conectar (%d)" % n,
+                               state="normal" if n else "disabled")
+
+        def confirmar():
+            elegidos = [ip for ip, v in seleccion.items() if v]
+            if not elegidos:
+                return
+            win.destroy()
+            self.threaded(lambda: self._conectar_ips(elegidos, port))
+
+        ctk.CTkButton(btnbar, text="Cancelar", command=win.destroy,
+                      fg_color="transparent", border_width=1,
+                      border_color=COLOR_BORDER, hover_color=COLOR_BISEL, width=110
+                      ).grid(row=0, column=1, padx=6)
+        conectar = ctk.CTkButton(btnbar, text="Conectar", command=confirmar,
+                                 width=150, fg_color=COLOR_ACCENT,
+                                 hover_color=COLOR_ACCENT_HOVER, text_color="#ffffff")
+        conectar.grid(row=0, column=2, padx=6)
+        refrescar_boton()
 
     def action_run_command(self):
         linea = self.cmd_var.get().strip()
