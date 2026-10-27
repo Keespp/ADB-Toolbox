@@ -4,6 +4,7 @@ import re
 import sys
 import json
 import time
+import hashlib
 import shlex
 import shutil
 import socket
@@ -19,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 APP_NAME = "ADB Toolbox"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 APP_VENDOR = "keesp"
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".adb_toolbox")
@@ -146,6 +147,13 @@ def _ico_tv(d):
     d.line((32, 86, 64, 86), fill=255, width=_TRAZO)
     d.line((48, 72, 48, 86), fill=255, width=_TRAZO)
 
+def _ico_preparar(d):
+    d.rounded_rectangle((8, 16, 88, 70), 8, outline=255, width=_TRAZO)
+    d.line((32, 84, 64, 84), fill=255, width=_TRAZO)
+    d.line((48, 70, 48, 84), fill=255, width=_TRAZO)
+    d.line((30, 44, 43, 56), fill=255, width=_TRAZO)
+    d.line((43, 56, 66, 31), fill=255, width=_TRAZO)
+
 def _ico_mando(d):
     d.rounded_rectangle((6, 30, 90, 76), 16, outline=255, width=_TRAZO)
     d.line((22, 53, 42, 53), fill=255, width=_TRAZO - 1)
@@ -201,6 +209,7 @@ ICONOS = {
     "camara": _ico_camara, "panel": _ico_panel, "ajustes": _ico_ajustes,
     "paquete": _ico_paquete, "carpeta": _ico_carpeta, "documento": _ico_documento,
     "energia": _ico_energia, "wifi": _ico_wifi, "tv": _ico_tv, "mando": _ico_mando,
+    "preparar": _ico_preparar,
     "refrescar": _ico_refrescar, "engranaje": _ico_engranaje,
     "chevron": _ico_chevron, "chevron_arriba": _ico_chevron_arriba,
     "copiar": _ico_copiar, "papelera": _ico_papelera, "conectar": _ico_conectar,
@@ -242,6 +251,140 @@ TVBOX_MODES = ["1080p60hz", "1080p50hz", "720p60hz", "720p50hz",
 
 SYS_DISPLAY_MODE = "/sys/class/display/mode"
 SYS_DISP_CAP = "/sys/class/amhdmitx/amhdmitx0/disp_cap"
+
+PREP_TVHOME = "com.gathin.tvhome/.MainActivity"
+PREP_FLAUNCHER = "me.efesser.flauncher/.MainActivity"
+PREP_FLAUNCHER_SHA256 = ("376fc528c880cdf7c7c04b2d3708c69f"
+                         "911144498218babb6300808b772af32e")
+PREP_SDK_TVHOME = 26
+PREP_TEMA_PKG = "com.gathin.tvhome"
+PREP_TEMA_DIR = "/sdcard/Android/data/com.gathin.tvhome/files"
+PREP_TEMA_URI = "content://com.gathin.tvhome.theme"
+PREP_TEMA_TMP = "/data/local/tmp/adbtoolbox-tema"
+PREP_FONDO_FLAUNCHER = "/sdcard/Pictures/fondo-tvbox.jpg"
+PREP_ARRANQUE_INTENTOS = 60
+PREP_PUERTO = 5555
+PREP_HOME = ["-a", "android.intent.action.MAIN", "-c", "android.intent.category.HOME"]
+PREP_RESUMIDA = "dumpsys activity activities | grep mResumedActivity"
+
+PREP_PAQUETE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+")
+PREP_COMPONENTE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/([A-Za-z0-9_.$]+)")
+PREP_NUCLEO = re.compile(
+    r"android|com\.android\.systemui|com\.android\.shell|com\.android\.phone|"
+    r"com\.android\.settings|com\.android\.tv\.settings|"
+    r"com\.(google\.)?android\.(permissioncontroller|packageinstaller|ext\.services|"
+    r"ext\.shared|modulemetadata)|com\.google\.android\.overlay\.modules.*|"
+    r"com\.android\.providers\..*")
+PREP_NUCLEO_OK = re.compile(
+    r"com\.android\.providers\.(calendar|contacts|userdictionary|blockednumber)")
+PREP_NO_LANZADORES = ("com.google.android.tungsten.setupwraith",
+                      "com.android.tv.settings", "com.android.settings",
+                      "com.android.provision")
+PREP_FABRICA = re.compile(r"ftest|devicetest|factory|hkcfac|factorymenu", re.I)
+PREP_WEBVIEWS = ("com.google.android.webview", "com.android.webview",
+                 "com.android.chrome")
+
+PREP_PASOS = ("identificar", "copia", "desactivar", "lanzador", "senal",
+              "reinicio", "cierre")
+PREP_TITULOS = {
+    "identificar": "1 · Identificar equipo", "copia": "2 · Copia de seguridad",
+    "desactivar": "3 · Desactivar bloatware", "lanzador": "4 · Lanzador y tema",
+    "senal": "5 · App de señalización", "reinicio": "6 · Reiniciar y verificar",
+    "cierre": "7 · Cerrar ADB y comprobar",
+}
+PREP_ARCHIVOS = (
+    ("tvprep_tvhome", "Lanzador",
+     "APK de com.gathin.tvhome, para Android 8 o superior (SDK 26+)"),
+    ("tvprep_flauncher", "FLauncher",
+     "FLauncher 0.18.0, para Android 7 (SDK 25), donde el otro no corre"),
+    ("tvprep_tema", "Tema", "Carpeta con config.json y wallpaper.jpg del lanzador"),
+    ("tvprep_senal", "Señalización", "APK de tu app de señalización"),
+)
+
+PREP_COPIA = (
+    ("paquetes-todos.txt", ["pm", "list", "packages", "-f", "-u", "-i"]),
+    ("paquetes-deshabilitados.txt", ["pm", "list", "packages", "-d"]),
+    ("paquetes-habilitados.txt", ["pm", "list", "packages", "-e"]),
+    ("paquetes-sistema.txt", ["pm", "list", "packages", "-s"]),
+    ("paquetes-terceros.txt", ["pm", "list", "packages", "-3"]),
+    ("getprop.txt", ["getprop"]),
+    ("ajustes-global.txt", ["settings", "list", "global"]),
+    ("ajustes-secure.txt", ["settings", "list", "secure"]),
+    ("ajustes-system.txt", ["settings", "list", "system"]),
+    ("home.txt", ["cmd", "package", "resolve-activity", "--brief"] + PREP_HOME),
+    ("home-candidatos.txt", ["cmd", "package", "query-activities", "--brief"]
+     + PREP_HOME),
+    ("wm-size.txt", ["wm", "size"]),
+    ("wm-density.txt", ["wm", "density"]),
+)
+
+PERFILES_TVBOX = {
+    "p291": {
+        "nombre": "Amlogic p291 (S905L2)",
+        "device": "p291", "plataforma": "p291", "sdk": "28",
+        "lanzador_serie": "com.droidlogic.mboxlauncher/.Launcher",
+        "explorador": "com.droidlogic.FileBrower",
+        "lotes": (
+            ("Servicios de fondo y relleno del lanzador", (
+                "com.charon.rocketfly", "com.master.apps",
+                "com.google.android.leanbacklauncher.partnercustomizer",
+                "com.google.android.atv.widget", "com.google.android.landscape",
+                "com.google.android.backdrop", "com.android.printspooler",
+                "com.android.smspush", "com.google.android.syncadapters.contacts")),
+            ("Apps de sistema sospechosas, test de fábrica y contenido", (
+                "com.abc.ninja", "com.ftest", "com.google.android.tvrecommendations",
+                "com.android.mgstv", "net.emotn.screencast")),
+            ("Streaming, navegador y voz", (
+                "com.google.android.youtube.tv", "com.netflix.mediaclient",
+                "com.master.accessibility", "com.amazon.avod.thirdpartyclient",
+                "com.android.chrome", "com.google.android.katniss")),
+            ("Apps precargadas y actualizador OTA", (
+                "com.droidlogic.videoplayer", "com.android.gallery3d",
+                "com.droidlogic.otaupgrade")),
+        ),
+    },
+    "rk322x_box": {
+        "nombre": "Rockchip RK322x (MXQ)",
+        "device": "rk322x_box", "plataforma": "rk322x", "sdk": "25",
+        "lanzador_serie": "com.ik.MXQ_Stick_MINI_8K/com.starmax.launcher.MainActivity",
+        "explorador": "com.android.rockchip",
+        "lotes": (
+            ("Servicios de fondo", (
+                "com.charon.rocketfly", "com.android.printspooler",
+                "com.google.android.syncadapters.calendar",
+                "com.google.android.syncadapters.contacts", "com.svox.pico")),
+            ("Apps de sistema sospechosas, test de fábrica y tiendas", (
+                "com.yxotakeji.cdm", "com.oranth.accessibility", "com.soya.store",
+                "cm.aptoide.pt", "com.DeviceTest")),
+            ("Streaming, IPTV y envío de pantalla", (
+                "com.google.android.youtube.tv", "com.netflix.mediaclient",
+                "com.amazon.avod.thirdpartyclient", "com.xuper.netxxus",
+                "org.xbmc.kodi", "com.waxrain.airplaydmr", "com.rockchip.wfd",
+                "com.rockchips.dlna")),
+            ("Apps multimedia precargadas", (
+                "com.rockchips.mediacenter", "com.android.music")),
+        ),
+    },
+}
+
+PREP_GUIA_FLAUNCHER = (
+    ("Fondo", "Ajustes de FLauncher › Wallpaper › Custom, y elige "
+              "Pictures › fondo-tvbox.jpg. El paso 4 lo deja ahí si el tema trae "
+              "wallpaper.jpg."),
+    ("Ocultar Chrome, Descargas y FLauncher",
+     "Ajustes › Applications › el ojo tachado de cada una. Chrome se oculta pero "
+     "no se desactiva: en esta caja es el proveedor de WebView. Se recuperan en la "
+     "pestaña del ojo tachado."),
+    ("Categorías", "Ajustes › Categories: «Signage» arriba y «Herramientas» "
+                   "(explorador, Play Store, Ajustes). Una app nueva no sale sola en "
+                   "Home: Applications › botón [+] de la app › su categoría."),
+    ("Telemetría", "En los ajustes de FLauncher apaga «Crash Reporting» y "
+                   "«Analytics Reporting»."),
+    ("Nombres sin tildes", "Lo que se escriba por ADB va sin tildes ni ñ: en Android 7 "
+                           "«input text» no las admite. Con el mando se corrigen en "
+                           "Categories › ⚙ › lápiz."),
+)
 
 CMD_VERSIONES = ("for p in $(pm list packages %s | cut -d: -f2); do "
                  "echo PKG:$p; "
@@ -410,6 +553,7 @@ class ADBToolbox(ctk.CTk):
 
         self.tvbox_pkg = self.cfg.get("tvbox_pkg", TVBOX_PKG)
         self._tv_busy = False
+        self._prep = {}
 
         default_shots = os.path.join(
             os.path.expanduser("~"), "Pictures", "ADB_Toolbox")
@@ -418,6 +562,10 @@ class ADBToolbox(ctk.CTk):
         default_logs = os.path.join(
             os.path.expanduser("~"), "Documents", "ADB_Toolbox", "registros")
         self.log_dir = self.cfg.get("log_dir", default_logs)
+
+        default_copias = os.path.join(
+            os.path.expanduser("~"), "Documents", "ADB_Toolbox", "copias-tvbox")
+        self.prep_dir = self.cfg.get("tvprep_dir", default_copias)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -656,6 +804,7 @@ class ADBToolbox(ctk.CTk):
                     ("Emparejar por WiFi (Android 11+)...", self.action_wifi_pair, GR),
                 ]),
                 ("tv", "TV Box", "tvbox"),
+                ("preparar", "Preparar TV Box", "tvprep"),
             ]),
         ]
 
@@ -672,7 +821,7 @@ class ADBToolbox(ctk.CTk):
             fila += 1
             for icon, name, buttons in secciones:
                 nav = ctk.CTkButton(
-                    self.sidebar, text="  " + name, anchor="w", height=32,
+                    self.sidebar, text="  " + name, anchor="w", height=30,
                     image=icono(icon, 16, COLOR_MUTED), compound="left",
                     font=self._fuente("cuerpo"), corner_radius=7,
                     fg_color="transparent", hover_color=COLOR_RAISED,
@@ -690,6 +839,8 @@ class ADBToolbox(ctk.CTk):
                     self.pages[name] = self._build_remote_page(icon, name)
                 elif buttons == "tvbox":
                     self.pages[name] = self._build_tvbox_page(icon, name)
+                elif buttons == "tvprep":
+                    self.pages[name] = self._build_prep_page(icon, name)
                 else:
                     self.pages[name] = self._build_page(icon, name, buttons)
 
@@ -1375,6 +1526,199 @@ class ADBToolbox(ctk.CTk):
         return {"modo": modo, "size": self._tv_size(modo), "dpi": dpi,
                 "pkg": pkg, "ntp": ntp, "forzar": bool(self.tv_force_var.get())}
 
+    def _build_prep_page(self, icon, name):
+        page = ctk.CTkFrame(self.content, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew", padx=18, pady=12)
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+
+        cabecera = ctk.CTkFrame(page, fg_color="transparent")
+        cabecera.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        cabecera.grid_columnconfigure(0, weight=1)
+        self._cabecera_pagina(
+            cabecera, icon, "Preparar TV Box",
+            "Deja lista una caja de señalización: copia de seguridad, desactiva el "
+            "bloatware (nunca desinstala), pone el lanzador, instala tu app y lo "
+            "comprueba tras reiniciar."
+        ).grid(row=0, column=0, sticky="ew")
+        self._boton_icono(cabecera, "documento", self.action_prep_guia,
+                          "Pasos de FLauncher que sólo se hacen con el mando"
+                          ).grid(row=0, column=1, sticky="ne", padx=(10, 0))
+
+        body = self._scroll_autohide(
+            ctk.CTkScrollableFrame(page, fg_color="transparent"))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.grid_columnconfigure((0, 1), weight=1)
+
+        card = ctk.CTkFrame(body, fg_color=COLOR_BG, corner_radius=RADIO_TARJETA,
+                            border_width=1, border_color=COLOR_BORDER_SOFT)
+        card.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 10))
+        card.grid_columnconfigure((1, 4), weight=1)
+
+        def margen(fila):
+            return (10 if fila == 0 else 3, 10 if fila == 2 else 3)
+
+        def etiqueta(texto, fila, col, ayuda=None):
+            e = ctk.CTkLabel(card, text=texto, text_color=COLOR_MUTED, anchor="w",
+                             height=20, font=self._fuente("dato"))
+            e.grid(row=fila, column=col, sticky="w", padx=(14, 8), pady=margen(fila))
+            if ayuda:
+                self._ayuda(e, ayuda)
+
+        etiqueta("Equipo", 0, 0)
+        self.prep_equipo = ctk.CTkLabel(
+            card, text="sin identificar: pulsa «1 · Identificar equipo»", anchor="w",
+            height=20, text_color=COLOR_FAINT, font=self._fuente("dato"))
+        self.prep_equipo.grid(row=0, column=1, columnspan=5, sticky="ew",
+                              padx=(0, 14), pady=margen(0))
+
+        self.prep_archivos = {}
+        for i, (clave, texto, ayuda) in enumerate(PREP_ARCHIVOS):
+            fila, col = 1 + i // 2, (i % 2) * 3
+            etiqueta(texto, fila, col, ayuda)
+            valor = ctk.CTkLabel(card, text="—", anchor="w", height=20, width=100,
+                                 font=self._fuente("dato"))
+            valor.grid(row=fila, column=col + 1, sticky="ew", pady=margen(fila))
+            self.prep_archivos[clave] = valor
+            boton = self._styled_button(card, "Elegir…",
+                                        lambda c=clave: self._prep_elegir(c),
+                                        "accent", height=26)
+            boton.configure(width=66)
+            boton.grid(row=fila, column=col + 2, padx=(6, 14 if col else 12),
+                       pady=margen(fila))
+        self._prep_refrescar_archivos()
+
+        self._styled_button(
+            body, "Asistente completo   ·   pasos 1 a 7, confirmando cada uno",
+            self.action_prep_asistente, "green", height=46
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
+
+        botones = [
+            (PREP_TITULOS["identificar"], self.action_prep_identificar, "accent"),
+            (PREP_TITULOS["copia"], self.action_prep_copia, "accent"),
+            (PREP_TITULOS["desactivar"], self.action_prep_desactivar, "accent"),
+            (PREP_TITULOS["lanzador"], self.action_prep_lanzador, "accent"),
+            (PREP_TITULOS["senal"], self.action_prep_senal, "accent"),
+            (PREP_TITULOS["reinicio"], self.action_prep_reinicio, "amber"),
+            (PREP_TITULOS["cierre"], self.action_prep_cierre, "accent"),
+            ("Restaurar desde una copia", self.action_prep_restaurar, "red"),
+        ]
+        for idx, (texto, comando, key) in enumerate(botones):
+            self._styled_button(body, texto, comando, key, height=38).grid(
+                row=2 + idx // 2, column=idx % 2, padx=4, pady=3, sticky="ew")
+        return page
+
+    def _prep_refrescar_archivos(self):
+        for clave, valor in self.prep_archivos.items():
+            ruta = self.cfg.get(clave, "")
+            nombre = os.path.basename(ruta.rstrip("\\/")) if ruta else ""
+            if len(nombre) > 18:
+                nombre = nombre[:17] + "…"
+            valor.configure(text=nombre or "—",
+                            text_color=COLOR_TEXT if ruta and os.path.exists(ruta)
+                            else COLOR_FAINT)
+
+    @staticmethod
+    def _prep_sha256(ruta):
+        h = hashlib.sha256()
+        with open(ruta, "rb") as f:
+            for trozo in iter(lambda: f.read(1 << 20), b""):
+                h.update(trozo)
+        return h.hexdigest()
+
+    @staticmethod
+    def _prep_tema_problema(ruta):
+        config = os.path.join(ruta, "config.json")
+        if not os.path.isfile(config):
+            return f"La carpeta del tema no tiene config.json: {ruta}"
+        try:
+            with open(config, "r", encoding="utf-8") as f:
+                json.load(f)
+        except (OSError, ValueError) as e:
+            return f"El config.json del tema no es JSON válido ({e})."
+        return ""
+
+    def _prep_elegir(self, clave):
+        actual = self.cfg.get(clave, "")
+        nombre = next(t for c, t, _ in PREP_ARCHIVOS if c == clave)
+        if clave == "tvprep_tema":
+            ruta = filedialog.askdirectory(
+                title="Carpeta del tema (config.json y wallpaper.jpg)",
+                initialdir=actual if os.path.isdir(actual) else None)
+            if not ruta:
+                return None
+            problema = self._prep_tema_problema(ruta)
+            if problema:
+                self.log(f"✗ {problema}")
+                return None
+        else:
+            ruta = filedialog.askopenfilename(
+                title=f"APK: {nombre}",
+                initialdir=os.path.dirname(actual) if actual else None,
+                filetypes=[("APK", "*.apk"), ("Todos", "*.*")])
+            if not ruta:
+                return None
+            if clave == "tvprep_flauncher":
+                huella = self._prep_sha256(ruta)
+                if huella != PREP_FLAUNCHER_SHA256 and not messagebox.askyesno(
+                        "FLauncher sin verificar",
+                        "Este APK no es el FLauncher 0.18.0 publicado:\n\n"
+                        f"SHA-256 esperado:\n{PREP_FLAUNCHER_SHA256}\n\n"
+                        f"SHA-256 del archivo:\n{huella}\n\n"
+                        "¿Usarlo de todas formas?", icon="warning"):
+                    self.log("✗ FLauncher descartado: su SHA-256 no es el publicado.")
+                    return None
+        self.cfg[clave] = ruta
+        save_config(self.cfg)
+        self._prep_refrescar_archivos()
+        self.log(f"✓ {nombre}: {ruta}")
+        return ruta
+
+    def _prep_ventana_guia(self):
+        win = ctk.CTkToplevel(self)
+        win.title("FLauncher: pasos con el mando")
+        win.geometry("600x540")
+        win.configure(fg_color=COLOR_BG)
+        win.transient(self)
+        self._cromo_windows(win)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(win, text="FLauncher: lo que sólo se hace con el mando",
+                     font=self._fuente("titulo"), height=24, text_color=COLOR_TEXT
+                     ).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
+        ctk.CTkLabel(win, text="En las cajas Android 7 (SDK 25), donde el lanzador "
+                               "del repo no corre. Ajustes de FLauncher: el engranaje "
+                               "de arriba a la derecha.",
+                     font=self._fuente("menudo"), text_color=COLOR_MUTED, anchor="w",
+                     justify="left", wraplength=560
+                     ).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 10))
+
+        lista = ctk.CTkFrame(win, fg_color=COLOR_CARD, corner_radius=RADIO_TARJETA,
+                             border_width=1, border_color=COLOR_BORDER)
+        lista.grid(row=2, column=0, sticky="nsew", padx=18)
+        lista.grid_columnconfigure(1, weight=1)
+        ultimo = len(PREP_GUIA_FLAUNCHER) - 1
+        for i, (titulo, texto) in enumerate(PREP_GUIA_FLAUNCHER):
+            arriba = 12 if i == 0 else 6
+            ctk.CTkLabel(lista, text=str(i + 1), width=22, height=20,
+                         text_color=COLOR_ACCENT, font=self._fuente("seccion")
+                         ).grid(row=i * 2, column=0, sticky="nw", padx=(14, 6),
+                                pady=(arriba, 0))
+            ctk.CTkLabel(lista, text=titulo, anchor="w", height=20,
+                         text_color=COLOR_TEXT, font=self._fuente("seccion")
+                         ).grid(row=i * 2, column=1, sticky="w", padx=(0, 14),
+                                pady=(arriba, 0))
+            ctk.CTkLabel(lista, text=texto, anchor="w", justify="left",
+                         wraplength=500, text_color=COLOR_MUTED,
+                         font=self._fuente("dato")
+                         ).grid(row=i * 2 + 1, column=1, sticky="w", padx=(0, 14),
+                                pady=(0, 12 if i == ultimo else 4))
+
+        self._styled_button(win, "Cerrar", win.destroy, "muted", height=34
+                            ).grid(row=3, column=0, sticky="e", padx=18, pady=14)
+        return win
+
     def _estilo_tabla(self):
         estilo = ttk.Style()
         estilo.theme_use("default")
@@ -1521,6 +1865,9 @@ class ADBToolbox(ctk.CTk):
             ("Registros", "registros",
              [("Cambiar…", lambda: self._ajuste_carpeta("log_dir")),
               ("Abrir", self.action_open_logs)]),
+            ("Copias del TV Box", "copias",
+             [("Cambiar…", lambda: self._ajuste_carpeta("tvprep_dir")),
+              ("Abrir", self.action_prep_abrir_copias)]),
         ])
 
         tarjeta = ctk.CTkFrame(cuerpo, fg_color=COLOR_BG, corner_radius=RADIO_TARJETA,
@@ -1597,7 +1944,8 @@ class ADBToolbox(ctk.CTk):
                 ("adb", self.adb_path, "no encontrado"),
                 ("scrcpy", self.scrcpy_path, "sin configurar"),
                 ("capturas", self.screenshot_dir, ""),
-                ("registros", self.log_dir, "")):
+                ("registros", self.log_dir, ""),
+                ("copias", self.prep_dir, "")):
             etiqueta = self.ajustes_valores.get(clave)
             if etiqueta is not None:
                 etiqueta.configure(text=corto(ruta, vacio),
@@ -1613,14 +1961,13 @@ class ADBToolbox(ctk.CTk):
         self._ajustes_refrescar()
 
     def _ajuste_carpeta(self, clave):
-        actual = self.screenshot_dir if clave == "screenshot_dir" else self.log_dir
-        destino = filedialog.askdirectory(title="Elige la carpeta", initialdir=actual)
+        atributo = {"screenshot_dir": "screenshot_dir", "log_dir": "log_dir",
+                    "tvprep_dir": "prep_dir"}[clave]
+        destino = filedialog.askdirectory(title="Elige la carpeta",
+                                          initialdir=getattr(self, atributo))
         if not destino:
             return
-        if clave == "screenshot_dir":
-            self.screenshot_dir = destino
-        else:
-            self.log_dir = destino
+        setattr(self, atributo, destino)
         self.cfg[clave] = destino
         save_config(self.cfg)
         self.log(f"✓ Carpeta guardada: {destino}")
@@ -3582,17 +3929,20 @@ class ADBToolbox(ctk.CTk):
         except Exception as e:
             self.log(f"✗ {e}")
 
-    def _tv_start(self, worker):
+    def _tv_start(self, worker, despues=None):
         if self._tv_busy:
             self.log("⏳ Ya hay una operación de TV Box en curso.")
             return
         self._tv_busy = True
 
         def _w():
+            hecho = None
             try:
-                worker()
+                hecho = worker()
             finally:
                 self._tv_busy = False
+                if despues:
+                    self.after(0, lambda: despues(hecho))
         self.threaded(_w)
 
     def _tv_is_tcp(self):
@@ -3946,6 +4296,887 @@ class ADBToolbox(ctk.CTk):
         self._log_lines(s, "  ")
         self._log_lines(d, "  ")
         self.log("════════ Fin ════════")
+
+    def action_prep_asistente(self):
+        if not (self.ensure_adb() and self.ensure_device()):
+            return
+        self.log("════════ Asistente: preparar TV Box ════════")
+        self._prep_pasos(list(PREP_PASOS), asistente=True)
+
+    def action_prep_identificar(self):
+        self._prep_pasos(["identificar"])
+
+    def action_prep_copia(self):
+        self._prep_pasos(["copia"])
+
+    def action_prep_desactivar(self):
+        self._prep_pasos(["desactivar"])
+
+    def action_prep_lanzador(self):
+        self._prep_pasos(["lanzador"])
+
+    def action_prep_senal(self):
+        self._prep_pasos(["senal"])
+
+    def action_prep_reinicio(self):
+        self._prep_pasos(["reinicio"])
+
+    def action_prep_cierre(self):
+        self._prep_pasos(["cierre"])
+
+    def action_prep_guia(self):
+        self._prep_ventana_guia()
+
+    def action_prep_abrir_copias(self):
+        os.makedirs(self.prep_dir, exist_ok=True)
+        try:
+            os.startfile(self.prep_dir)
+        except Exception as e:
+            self.log(f"✗ {e}")
+
+    def action_prep_restaurar(self):
+        if not (self.ensure_adb() and self.ensure_device()):
+            return
+        carpeta = filedialog.askdirectory(
+            title="Copia de seguridad del equipo a restaurar",
+            initialdir=self.prep_dir if os.path.isdir(self.prep_dir) else None)
+        if not carpeta:
+            return
+        paquetes, home, problema = self._prep_leer_copia(carpeta)
+        if problema:
+            self.log(f"✗ {problema}")
+            return
+        if not messagebox.askyesno(
+                "Restaurar desde una copia",
+                f"Desde {carpeta}:\n\n"
+                f"  · pm enable de {len(paquetes)} paquete(s), uno por llamada\n"
+                f"  · Home de vuelta a {home or '(sin dato: se deja como está)'}\n\n"
+                "Lo que ya venía desactivado antes de la limpieza se queda como "
+                "estaba.\n\n¿Continuar?"):
+            return
+        self._tv_start(lambda: self._prep_restaurar_worker(paquetes, home))
+
+    def _prep_pasos(self, pasos, asistente=False):
+        if not pasos:
+            if asistente:
+                self.log("════════ Asistente terminado ════════")
+            return
+        if pasos[0] != "cierre":
+            if not (self.ensure_adb() and self.ensure_device()):
+                return
+            if (pasos[0] != "identificar"
+                    and self._prep.get("serial") != self.selected_serial):
+                pasos = ["identificar"] + list(pasos)
+        paso, resto = pasos[0], list(pasos[1:])
+        trabajo = getattr(self, "_prep_ui_" + paso)(asistente)
+        if trabajo is None:
+            self.log(f"  {PREP_TITULOS[paso]}: saltado.")
+            self._prep_pasos(resto, asistente)
+            return
+        if trabajo is False:
+            if asistente:
+                self.log("Asistente detenido. Sigue cuando quieras con el botón de "
+                         "cada paso.")
+            return
+        self._tv_start(trabajo, lambda hecho: self._prep_seguir(
+            hecho, paso, resto, asistente))
+
+    def _prep_seguir(self, hecho, paso, resto, asistente):
+        if hecho:
+            self._prep_pasos(resto, asistente)
+        elif resto:
+            self.log(f"✗ Se para en «{PREP_TITULOS[paso]}»: arregla lo que dice arriba "
+                     "y sigue con el botón de cada paso.")
+
+    def _prep_confirmar(self, titulo, texto, asistente):
+        if asistente:
+            r = messagebox.askyesnocancel(
+                titulo, texto + "\n\nSí: hacerlo   ·   No: saltar este paso   ·   "
+                                "Cancelar: parar el asistente")
+            return {True: "si", False: "saltar"}.get(r, "parar")
+        return "si" if messagebox.askyesno(titulo, texto + "\n\n¿Continuar?") else "parar"
+
+    @staticmethod
+    def _prep_respuesta(respuesta, trabajo):
+        if respuesta == "si":
+            return trabajo
+        return None if respuesta == "saltar" else False
+
+    def _prep_perfil(self):
+        return PERFILES_TVBOX.get(self._prep.get("perfil") or "")
+
+    @staticmethod
+    def _prep_paquetes(perfil):
+        return [p for _, grupo in perfil["lotes"] for p in grupo]
+
+    def _prep_requisitos(self, paso):
+        perfil = self._prep_perfil()
+        if not perfil:
+            self.log(f"✗ {PREP_TITULOS[paso]}: este modelo no tiene perfil probado, así "
+                     "que sólo se hace inventario y copia de seguridad. No se "
+                     "desactiva nada.")
+            return None
+        if not self._prep.get("carpeta"):
+            self.log(f"✗ {PREP_TITULOS[paso]}: antes hace falta la copia de seguridad "
+                     "de este equipo (paso 2), que es lo que permite deshacerlo.")
+            return None
+        return perfil
+
+    def _prep_ui_identificar(self, asistente):
+        return self._prep_identificar_worker
+
+    def _prep_ui_copia(self, asistente):
+        return self._prep_copia_worker
+
+    def _prep_ui_desactivar(self, asistente):
+        perfil = self._prep_requisitos("desactivar")
+        if not perfil:
+            return False
+        r = self._prep_confirmar(
+            "Desactivar bloatware",
+            f"Perfil {perfil['nombre']}: se desactivan hasta "
+            f"{len(self._prep_paquetes(perfil))} paquetes con «pm disable-user --user "
+            "0», uno por llamada. No se desinstala nada y se deshace con «Restaurar "
+            "desde una copia».\n\nSe saltan solos el núcleo de Android, el dueño de "
+            "Home si no hay otro lanzador, lo que pide TV_INPUT_HARDWARE y el "
+            "proveedor de WebView. El lanzador de serie espera al paso 4.", asistente)
+        return self._prep_respuesta(
+            r, lambda: self._prep_desactivar_worker(perfil["lotes"]))
+
+    def _prep_ui_lanzador(self, asistente):
+        perfil = self._prep_requisitos("lanzador")
+        if not perfil:
+            return False
+        sdk = self._prep.get("sdk", 0)
+        flauncher = sdk < PREP_SDK_TVHOME
+        clave = "tvprep_flauncher" if flauncher else "tvprep_tvhome"
+        componente = PREP_FLAUNCHER if flauncher else PREP_TVHOME
+        apk = self.cfg.get(clave, "")
+        if not os.path.isfile(apk):
+            apk = self._prep_elegir(clave)
+            if not apk:
+                self.log("  Sin el APK del lanzador no se cambia el Home.")
+                return None if asistente else False
+        tema = self.cfg.get("tvprep_tema", "")
+        if tema and self._prep_tema_problema(tema):
+            self.log(f"⚠ {self._prep_tema_problema(tema)} Se sigue sin tema.")
+            tema = ""
+        if flauncher:
+            aviso = (f"SDK {sdk}: el lanzador del repo pide SDK {PREP_SDK_TVHOME}, así "
+                     "que se usa FLauncher.\n\n")
+            extra = ((f"  5. Dejar el fondo en {PREP_FONDO_FLAUNCHER}\n" if tema else "")
+                     + "  6. Abrir la guía de lo que se hace con el mando\n")
+        else:
+            aviso = ""
+            extra = f"  5. Subir el tema «{os.path.basename(tema)}»\n" if tema else ""
+        r = self._prep_confirmar(
+            "Lanzador",
+            aviso + f"  1. Instalar {os.path.basename(apk)} (push + pm install -r)\n"
+            "  2. Ponerlo como Home y arrancarlo\n"
+            "  3. Sólo si queda en primer plano, desactivar el de serie\n"
+            f"      ({perfil['lanzador_serie'].split('/')[0]})\n"
+            "  4. Pulsar HOME y comprobar que sale el nuevo\n" + extra, asistente)
+        return self._prep_respuesta(
+            r, lambda: self._prep_lanzador_worker(apk, componente, perfil, tema))
+
+    def _prep_ui_senal(self, asistente):
+        apk = self.cfg.get("tvprep_senal", "")
+        if not os.path.isfile(apk):
+            apk = self._prep_elegir("tvprep_senal")
+            if not apk:
+                return None if asistente else False
+        perfil = self._prep_perfil()
+        texto = (f"Se instala {os.path.basename(apk)} con push + «pm install -r» "
+                 "(«adb install» puede quedarse esperando una confirmación en la caja).")
+        if perfil:
+            texto += ("\n\nY se deja activo el explorador de archivos de la caja "
+                      f"({perfil['explorador']}), para instalar APK desde un USB.")
+        r = self._prep_confirmar("App de señalización", texto, asistente)
+        return self._prep_respuesta(r, lambda: self._prep_senal_worker(apk, perfil))
+
+    def _prep_ui_reinicio(self, asistente):
+        r = self._prep_confirmar(
+            "Reiniciar y verificar",
+            "Se reinicia la caja, se espera a que termine de arrancar "
+            "(sys.boot_completed) y se comprueba que lo desactivado sigue desactivado "
+            "y que Home sigue siendo el lanzador nuevo.", asistente)
+        return self._prep_respuesta(r, self._prep_reinicio_worker)
+
+    def _prep_ui_cierre(self, asistente):
+        messagebox.showinfo(
+            "Cerrar ADB",
+            "Con el mando, en la caja:\n\nAjustes › Preferencias del dispositivo › "
+            "Opciones para desarrolladores › desactiva «Depuración USB» y "
+            "«Depuración por red», y reinicia la caja.\n\nEstas cajas traen "
+            "ro.adb.secure=0 y su con setuid: con la depuración encendida, cualquier "
+            "equipo de la red abre una shell de root sin preguntar.")
+        if not messagebox.askyesno(
+                "Cerrar ADB",
+                "¿Ya está desactivada y la caja reiniciada?\n\nSí: comprobar ahora que "
+                f"el puerto {PREP_PUERTO} rechaza la conexión.\nNo: compruébalo luego "
+                f"con «{PREP_TITULOS['cierre']}»."):
+            self.log(f"  Cuando la cierres, pulsa «{PREP_TITULOS['cierre']}».")
+            return None
+        host = next((s.split(":")[0] for s in (self.selected_serial,
+                                               self._prep.get("serial"))
+                     if s and ":" in s), "")
+        if not host:
+            host = self._ask_text("Comprobar ADB", "IP de la caja:", "") or ""
+        if not host:
+            return None
+        return lambda: self._prep_cierre_worker(host)
+
+    @staticmethod
+    def _prep_leer_paquetes(ruta):
+        paquetes = []
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                lineas = f.read().splitlines()
+        except OSError:
+            return paquetes
+        for linea in lineas:
+            limpia = linea.split("#", 1)[0].strip()
+            if limpia.startswith("package:"):
+                limpia = limpia[len("package:"):]
+            partes = limpia.split()
+            if partes and partes[0] not in paquetes:
+                paquetes.append(partes[0])
+        return paquetes
+
+    @staticmethod
+    def _prep_leer_claves(ruta):
+        datos = {}
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                for linea in f:
+                    if ":" in linea:
+                        clave, valor = linea.split(":", 1)
+                        datos[clave.strip()] = valor.strip()
+        except OSError:
+            pass
+        return datos
+
+    @staticmethod
+    def _prep_componente_home(texto):
+        lineas = [l.strip() for l in (texto or "").splitlines() if l.strip()]
+        if lineas and PREP_COMPONENTE.fullmatch(lineas[-1]):
+            return lineas[-1]
+        return None
+
+    def _prep_leer_copia(self, carpeta):
+        equipo = self._prep_leer_claves(os.path.join(carpeta, "equipo.txt"))
+        perfil = PERFILES_TVBOX.get(equipo.get("perfil", ""))
+        aplicada = os.path.join(carpeta, "lista-aplicada.txt")
+        if os.path.isfile(aplicada):
+            paquetes = self._prep_leer_paquetes(aplicada)
+        elif perfil:
+            previos = self._prep_leer_paquetes(
+                os.path.join(carpeta, "paquetes-deshabilitados.txt"))
+            paquetes = [p for p in self._prep_paquetes(perfil)
+                        + [perfil["lanzador_serie"].split("/")[0]] if p not in previos]
+        else:
+            return None, None, ("En esa carpeta no hay lista-aplicada.txt ni el perfil "
+                                "de un modelo conocido: no sé qué reactivar.")
+        malos = [p for p in paquetes if not PREP_PAQUETE.fullmatch(p)]
+        if malos:
+            return None, None, ("La lista tiene algo que no es un nombre de paquete: "
+                                + ", ".join(malos) + ". No se cambió nada.")
+        try:
+            with open(os.path.join(carpeta, "home.txt"), "r", encoding="utf-8") as f:
+                home = self._prep_componente_home(f.read())
+        except OSError:
+            home = None
+        nuevos = (PREP_TVHOME.split("/")[0], PREP_FLAUNCHER.split("/")[0])
+        if not home or home.split("/")[0] in nuevos:
+            home = perfil["lanzador_serie"] if perfil else None
+        return paquetes, home, None
+
+    def _prep_lista(self, *filtros):
+        _, out, _ = self.run_adb(["exec-out", "pm", "list", "packages"] + list(filtros),
+                                 timeout=60)
+        return {l.split(":", 1)[1].strip() for l in out.splitlines()
+                if l.startswith("package:")}
+
+    def _prep_home_actual(self):
+        _, out, _ = self.run_adb(
+            ["exec-out", "cmd", "package", "resolve-activity", "--brief"] + PREP_HOME,
+            timeout=30)
+        return self._prep_componente_home(out)
+
+    def _prep_candidatos_home(self):
+        _, out, _ = self.run_adb(
+            ["exec-out", "cmd", "package", "query-activities", "--brief"] + PREP_HOME,
+            timeout=30)
+        candidatos = []
+        for linea in out.splitlines():
+            m = PREP_COMPONENTE.fullmatch(linea.strip())
+            if (m and not m.group(2).endswith("FallbackHome")
+                    and m.group(1) not in candidatos):
+                candidatos.append(m.group(1))
+        return candidatos
+
+    def _prep_delante(self):
+        _, out, _ = self.run_adb(["exec-out", "sh", "-c", PREP_RESUMIDA], timeout=30)
+        return re.findall(r"mResumedActivity: ActivityRecord\{\S+ u\d+ "
+                          r"([\w.]+/[\w.$]+)", out)
+
+    @staticmethod
+    def _prep_es(componentes, pkg):
+        return any(c.split("/")[0] == pkg for c in componentes)
+
+    def _prep_webview(self):
+        _, out, _ = self.run_adb(["exec-out", "dumpsys", "webviewupdate"], timeout=30)
+        m = re.search(r"Current WebView package \(name, version\): \(([\w.]+)", out)
+        return (m.group(1),) if m else PREP_WEBVIEWS
+
+    @staticmethod
+    def _prep_es_nucleo(pkg):
+        return bool(PREP_NUCLEO.fullmatch(pkg)) and not PREP_NUCLEO_OK.fullmatch(pkg)
+
+    @staticmethod
+    def _prep_pide_tv_input(dumpsys):
+        dentro = False
+        for cruda in (dumpsys or "").splitlines():
+            linea = cruda.strip()
+            if linea.startswith("requested permissions:"):
+                dentro = True
+            elif re.match(r"(install permissions:|runtime permissions:|User \d+:)",
+                          linea):
+                dentro = False
+            elif dentro and "TV_INPUT_HARDWARE" in linea:
+                return True
+        return False
+
+    def _prep_salvaguardas(self, plan):
+        plan = list(plan)
+        dueno = self._prep_home_actual()
+        dueno_pkg = dueno.split("/")[0] if dueno else ""
+        candidatos = self._prep_candidatos_home()
+        if dueno_pkg in plan:
+            otros = [c for c in candidatos if c != dueno_pkg and c not in plan
+                     and c not in PREP_NO_LANZADORES and not PREP_FABRICA.search(c)]
+            if not otros:
+                self.log(f"  ⚠ Se salta {dueno_pkg}: es el dueño de Home y ningún otro "
+                         "lanzador instalado y activo responde a HOME. Pon antes el "
+                         "lanzador nuevo (paso 4).")
+                plan.remove(dueno_pkg)
+        elif not dueno_pkg:
+            for p in [p for p in plan if p in candidatos]:
+                self.log(f"  ⚠ Se salta {p}: no se pudo saber quién es Home y {p} "
+                         "responde a HOME.")
+                plan.remove(p)
+        proveedores = self._prep_webview()
+        for p in [p for p in plan if p in proveedores]:
+            motivo = ("es el proveedor de WebView de esta caja" if len(proveedores) == 1
+                      else "la caja no dice cuál es su proveedor de WebView y puede "
+                           "serlo")
+            self.log(f"  ⚠ Se salta {p}: {motivo}; sin él no se ve ninguna web, "
+                     "tampoco la señalización.")
+            plan.remove(p)
+        for p in list(plan):
+            code, out, _ = self.run_adb(["exec-out", "dumpsys", "package", p],
+                                        timeout=45)
+            if code != 0:
+                self.log(f"  ⚠ Se salta {p}: no se pudo leer su dumpsys para ver si "
+                         "maneja las entradas HDMI/AV.")
+                plan.remove(p)
+            elif self._prep_pide_tv_input(out):
+                self.log(f"  ⚠ Se salta {p}: pide TV_INPUT_HARDWARE, la capa bajo las "
+                         "entradas HDMI/AV. Sin ella esas entradas se quedan en «Sin "
+                         "señal» y sólo una restauración y un arranque en frío lo "
+                         "arreglan.")
+                plan.remove(p)
+        return plan
+
+    def _prep_apuntar(self, paquetes):
+        ruta = os.path.join(self._prep.get("carpeta") or "", "lista-aplicada.txt")
+        try:
+            todos = self._prep_leer_paquetes(ruta)
+            todos += [p for p in paquetes if p not in todos]
+            with open(ruta, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Paquetes que ADB Toolbox desactivó en este equipo. "
+                        "«Restaurar desde una copia» los vuelve a activar.\n")
+                f.write("\n".join(todos) + "\n")
+        except OSError as e:
+            self.log(f"✗ No se pudo apuntar lo que se va a desactivar ({e}). Sin ese "
+                     "registro no se toca nada.")
+            return False
+        return True
+
+    def _prep_desactivar(self, paquete):
+        _, out, err = self.run_adb(["shell", f"pm disable-user --user 0 {paquete}"],
+                                   timeout=30)
+        self.log(f"    {paquete}: {(out + err).strip() or 'sin respuesta'}")
+
+    def _prep_comprobar(self, plan):
+        desactivados = self._prep_lista("-d")
+        fallan = [p for p in plan if p not in desactivados]
+        for p in fallan:
+            self.log(f"  ✗ {p} no sale en «pm list packages -d»: sigue activo.")
+        if fallan and len(fallan) == len(plan):
+            self.log("✗ El firmware rechaza «pm disable-user»: para aquí y no lo "
+                     "reintentes en bucle.")
+        elif not fallan:
+            self.log(f"✓ {len(plan)} desactivado(s), comprobado con «pm list packages "
+                     "-d».")
+        return not fallan
+
+    def _prep_instalar(self, apk, nombre):
+        remoto = f"{TMP_EQUIPO}/adbtoolbox-{nombre}.apk"
+        base = os.path.basename(apk)
+        code, salida = self.run_adb_transfer(["push", apk, remoto],
+                                             f"Enviando {base}", timeout=900)
+        if code != 0:
+            self.log(f"✗ No se pudo enviar {base}: {salida or 'sin detalle'}")
+            return False
+        self.log(f"  pm install -r {base} ...")
+        _, out, err = self.run_adb(["shell", f"pm install -r {remoto}"], timeout=600)
+        self.run_adb(["shell", f"rm -f {remoto}"], timeout=30)
+        respuesta = (out + err).strip()
+        if "Success" not in respuesta:
+            self.log(f"✗ pm install: {respuesta or 'sin respuesta'}")
+            return False
+        self.log(f"  ✓ {base} instalado.")
+        return True
+
+    def _prep_abrir(self, componente):
+        pkg = componente.split("/")[0]
+        if PREP_FABRICA.search(pkg):
+            self.log(f"✗ {pkg} es un paquete de fábrica: se desactiva, nunca se arranca.")
+            return False
+        _, out, err = self.run_adb(["shell", f"am start -W -n {componente}"], timeout=60)
+        fallo = next((l.strip() for l in (out + err).splitlines()
+                      if "Error" in l or "Exception" in l), "")
+        if fallo:
+            self.log(f"  ✗ am start: {fallo}")
+            return False
+        for _ in range(3):
+            if self._prep_es(self._prep_delante(), pkg):
+                self.log(f"  ✓ {pkg} en primer plano.")
+                return True
+            time.sleep(1)
+        return False
+
+    @staticmethod
+    def _prep_tema_poner(nombre):
+        origen = f"{PREP_TEMA_TMP}-{nombre.replace('/', '-')}"
+        destino = f"{PREP_TEMA_DIR}/{nombre}"
+        return (f"rm -f {destino} 2>/dev/null; {{ o=$(content write --uri "
+                f"{PREP_TEMA_URI}/{nombre} < {origen} 2>&1) && case $o in "
+                f"*Unsupported*) false ;; esac; }} || cp {origen} {destino} "
+                f"2>/dev/null; rm -f {origen}")
+
+    @staticmethod
+    def _prep_tema_quitar(nombre):
+        return (f"rm -f {PREP_TEMA_DIR}/{nombre} 2>/dev/null; content delete --uri "
+                f"{PREP_TEMA_URI}/{nombre} 2>/dev/null")
+
+    @staticmethod
+    def _prep_tema_reinicio():
+        p, home = PREP_TEMA_PKG, " ".join(PREP_HOME)
+        return (f"a=$(settings get secure enabled_accessibility_services); "
+                f"am force-stop {p}; case $(cmd package resolve-activity --brief "
+                f"{home} | tail -n 1) in {p}/*) am start {home} >/dev/null ;; *) "
+                f"am start -n {p}/.MainActivity >/dev/null ;; esac; case $a in "
+                f"*{p}*) sleep 1; settings put secure enabled_accessibility_services "
+                f"$a; settings put secure accessibility_enabled 1; sleep 1; settings "
+                f"put secure enabled_accessibility_services ''; settings put secure "
+                f"accessibility_enabled 0; sleep 1; settings put secure "
+                f"enabled_accessibility_services $a; settings put secure "
+                f"accessibility_enabled 1 ;; esac")
+
+    def _prep_tema_worker(self, tema):
+        self.log(f"  Tema «{os.path.basename(tema)}»...")
+        d, tmp = PREP_TEMA_DIR, PREP_TEMA_TMP
+        self.run_adb(["shell", f"mkdir -p {d} 2>/dev/null"], timeout=20)
+        code, salida = self.run_adb_transfer(
+            ["push", os.path.join(tema, "config.json"), f"{tmp}-config.json"],
+            "Subiendo el tema")
+        if code != 0:
+            self.log(f"  ✗ No se pudo subir config.json: {salida or 'sin detalle'}")
+            return False
+        self.run_adb(["shell", self._prep_tema_poner("config.json")], timeout=30)
+        fondo = os.path.join(tema, "wallpaper.jpg")
+        if os.path.isfile(fondo):
+            code, salida = self.run_adb_transfer(
+                ["push", fondo, f"{tmp}-wallpaper.jpg"], "Subiendo el fondo")
+            if code != 0:
+                self.log(f"  ✗ No se pudo subir el fondo: {salida or 'sin detalle'}")
+                return False
+            self.run_adb(["shell", self._prep_tema_poner("wallpaper.jpg")], timeout=30)
+        else:
+            self.run_adb(["shell", self._prep_tema_quitar("wallpaper.jpg")], timeout=30)
+        self.run_adb(["shell", f"mkdir -p {d}/wallpapers 2>/dev/null; rm -f "
+                      f"{d}/wallpapers/*.jpg {d}/wallpapers/*.jpeg "
+                      f"{d}/wallpapers/*.png {d}/wallpapers/*.webp 2>/dev/null; "
+                      f"content delete --uri {PREP_TEMA_URI}/wallpapers 2>/dev/null; "
+                      + self._prep_tema_quitar("wallpapers/captions.txt")], timeout=30)
+        revision = os.urandom(16).hex()
+        self.run_adb(["shell", f"printf %s {revision} > {tmp}-theme_revision; "
+                      + self._prep_tema_poner("theme_revision")], timeout=30)
+        self.run_adb(["shell", self._prep_tema_reinicio()], timeout=60)
+        self.log("  ✓ Tema aplicado y lanzador reiniciado.")
+        return True
+
+    def _prep_fondo_flauncher(self, tema):
+        fondo = os.path.join(tema, "wallpaper.jpg")
+        if not os.path.isfile(fondo):
+            return
+        self.run_adb(["shell", "mkdir -p /sdcard/Pictures"], timeout=20)
+        code, salida = self.run_adb_transfer(["push", fondo, PREP_FONDO_FLAUNCHER],
+                                             "Subiendo el fondo")
+        if code == 0:
+            self.log(f"  ✓ Fondo en {PREP_FONDO_FLAUNCHER}: elígelo con el mando "
+                     "(guía de FLauncher).")
+        else:
+            self.log(f"  ✗ No se pudo subir el fondo: {salida or 'sin detalle'}")
+
+    def _prep_esperar_arranque(self, intentos=PREP_ARRANQUE_INTENTOS):
+        for _ in range(15):
+            code, out, _ = self.run_adb(["exec-out", "echo", "ping"], timeout=10)
+            if code != 0 or "ping" not in out:
+                break
+            time.sleep(2)
+        else:
+            self.log("✗ La caja no llegó a apagarse: ¿ignoró el reinicio?")
+            return False
+        for _ in range(intentos):
+            time.sleep(3)
+            if self._tv_is_tcp():
+                self.run_adb(["connect", self.selected_serial], target_device=False,
+                             timeout=10)
+            if self._getprop("sys.boot_completed") == "1":
+                return True
+        self.log("✗ La caja no volvió a responder. Si es una RK322x, su adbd acepta "
+                 "una sola conexión TCP: cierra la del adb de Android Studio "
+                 "(adb disconnect) y vuelve a conectar.")
+        return False
+
+    def _prep_identificar_worker(self):
+        self.log(f"──── {PREP_TITULOS['identificar']} ────")
+        props = self._getprops_all()
+        if not props:
+            self.log("✗ El equipo no devolvió sus propiedades. ¿Sigue conectado? Si es "
+                     "una RK322x, su adbd acepta una sola conexión TCP: cierra la de "
+                     "Android Studio (adb disconnect).")
+            return False
+        device = props.get("ro.product.device", "")
+        plataforma = props.get("ro.board.platform", "")
+        sdk = props.get("ro.build.version.sdk", "")
+        rel = props.get("ro.build.version.release", "")
+        clave = next((c for c, p in PERFILES_TVBOX.items()
+                      if p["device"] == device and p["plataforma"] == plataforma
+                      and p["sdk"] == sdk), None)
+        serie = self._primera_prop(props, PROPS_SERIE) or self.selected_serial or ""
+        anterior = self._prep if self._prep.get("serial") == self.selected_serial else {}
+        self._prep = {"serial": self.selected_serial, "props": props, "perfil": clave,
+                      "sdk": int(sdk) if sdk.isdigit() else 0,
+                      "equipo": self._sanea(f"{device or 'equipo'}_{serie}"),
+                      "carpeta": anterior.get("carpeta"),
+                      "lanzador": anterior.get("lanzador")}
+        real = SDK_A_ANDROID.get(sdk)
+        self.log(f"  Modelo      : {props.get('ro.product.model', '?')}  "
+                 f"({props.get('ro.product.manufacturer', '?')})")
+        self.log(f"  Dispositivo : {device or '?'}   plataforma {plataforma or '?'}")
+        self.log(f"  Android     : la ROM dice {rel or '?'}; SDK {sdk or '?'}"
+                 + (f" = Android {real}" if real else ""))
+        if real and rel and not rel.startswith(real):
+            self.log(f"  ⚠ La ROM miente: el SDK {sdk} es Android {real}. Manda el SDK.")
+        if clave:
+            perfil = PERFILES_TVBOX[clave]
+            self.log(f"✓ Perfil {perfil['nombre']}: {len(self._prep_paquetes(perfil))} "
+                     "paquetes y el lanzador de serie.")
+        else:
+            parecido = next((p for p in PERFILES_TVBOX.values()
+                             if p["device"] == device), None)
+            if parecido:
+                self.log(f"⚠ Parece una {parecido['nombre']}, pero con plataforma "
+                         f"{plataforma or '?'} y SDK {sdk or '?'}: no es el firmware "
+                         "probado.")
+            self.log("⚠ Modelo sin perfil probado: sólo inventario y copia de "
+                     "seguridad. No se desactiva nada.")
+        if props.get("ro.adb.secure") == "0":
+            self.log("  ⚠ ro.adb.secure=0: con la depuración por red encendida, cualquier "
+                     f"equipo de la red entra por el puerto {PREP_PUERTO} sin preguntar.")
+        _, su, _ = self.run_adb(["exec-out", "ls", "-l", "/system/xbin/su"], timeout=15)
+        if re.match(r"-..s", su.strip()):
+            self.log("  ⚠ /system/xbin/su es setuid root: cualquier app puede pedir "
+                     "root. Sin reflashear no se quita; deja ADB cerrado al terminar.")
+        texto = (f"{device or '?'} · {plataforma or '?'} · SDK {sdk or '?'}"
+                 + (f" (Android {real})" if real else "") + "   —   "
+                 + (PERFILES_TVBOX[clave]["nombre"] if clave
+                    else "sin perfil: sólo inventario y copia"))
+        self.after(0, lambda: self.prep_equipo.configure(
+            text=texto, text_color=COLOR_TEXT if clave else COLOR_AMBER))
+        return True
+
+    @staticmethod
+    def _prep_inventario(salidas):
+        def nombres(texto):
+            return {l.split(":", 1)[1].strip() for l in texto.splitlines()
+                    if l.startswith("package:")}
+        desactivados = nombres(salidas["paquetes-deshabilitados.txt"])
+        activos = nombres(salidas["paquetes-habilitados.txt"])
+        sistema = nombres(salidas["paquetes-sistema.txt"])
+        filas = []
+        for linea in salidas["paquetes-todos.txt"].splitlines():
+            m = re.match(r"package:(\S+)=([A-Za-z0-9_.]+)(?:\s+installer=(\S+))?",
+                         linea.strip())
+            if not m:
+                continue
+            pkg = m.group(2)
+            estado = ("desactivado" if pkg in desactivados else
+                      "activo" if pkg in activos else "no instalado")
+            filas.append((pkg, estado, "sistema" if pkg in sistema else "terceros",
+                          "" if m.group(3) in (None, "null") else m.group(3)))
+        return sorted(filas)
+
+    def _prep_copia_worker(self):
+        self.log(f"──── {PREP_TITULOS['copia']} ────")
+        ahora = datetime.datetime.now()
+        carpeta = os.path.join(self.prep_dir, self._prep["equipo"],
+                               ahora.strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(carpeta, exist_ok=True)
+        salidas = {}
+        for nombre, args in PREP_COPIA:
+            _, out, _ = self.run_adb(["exec-out"] + args, timeout=120)
+            with open(os.path.join(carpeta, nombre), "w", encoding="utf-8",
+                      newline="\n") as f:
+                f.write(out)
+            salidas[nombre] = out
+        if "package:" not in salidas["paquetes-todos.txt"]:
+            self.log("✗ El equipo no devolvió la lista de paquetes: esta copia no vale "
+                     "y no se sigue.")
+            return False
+        props = self._prep.get("props", {})
+        with open(os.path.join(carpeta, "equipo.txt"), "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write(f"fecha: {ahora:%Y-%m-%d %H:%M:%S}\n"
+                    f"modelo: {props.get('ro.product.model', '')}\n"
+                    f"device: {props.get('ro.product.device', '')}\n"
+                    f"plataforma: {props.get('ro.board.platform', '')}\n"
+                    f"sdk: {props.get('ro.build.version.sdk', '')}\n"
+                    f"perfil: {self._prep.get('perfil') or ''}\n"
+                    f"home: {self._prep_componente_home(salidas['home.txt']) or ''}\n")
+        self._prep["carpeta"] = carpeta
+        filas = self._prep_inventario(salidas)
+        cuenta = lambda campo, valor: sum(1 for f in filas if f[campo] == valor)
+        self.log(f"  Inventario: {len(filas)} paquetes · {cuenta(2, 'sistema')} de "
+                 f"sistema · {cuenta(2, 'terceros')} de terceros · "
+                 f"{cuenta(1, 'desactivado')} ya desactivados")
+        self.log(f"  Home ahora: {self._prep_componente_home(salidas['home.txt']) or '?'}")
+        perfil = self._prep_perfil()
+        if perfil:
+            estados = {f[0]: f[1] for f in filas}
+            lista = self._prep_paquetes(perfil)
+            activos = sum(1 for p in lista if estados.get(p) == "activo")
+            ya = sum(1 for p in lista if estados.get(p) == "desactivado")
+            self.log(f"  Del perfil: {activos} activos por desactivar, {ya} ya "
+                     f"desactivados, {len(lista) - activos - ya} no están.")
+        else:
+            self.after(0, lambda: self.ventana_tabla(
+                "Inventario de paquetes", ["Paquete", "Estado", "Origen", "Instalador"],
+                filas, [300, 110, 90, 130]))
+        self.log(f"✓ Copia en {carpeta}")
+        self.log("  Lleva el número de serie de la caja: no la compartas.")
+        return True
+
+    def _prep_desactivar_worker(self, lotes):
+        self.log(f"──── {PREP_TITULOS['desactivar']} ────")
+        paquetes = [p for _, grupo in lotes for p in grupo]
+        malos = [p for p in paquetes if not PREP_PAQUETE.fullmatch(p)]
+        if malos:
+            self.log("✗ Lista rechazada, no son nombres de paquete: "
+                     + ", ".join(malos) + ". No se cambió nada.")
+            return False
+        nucleo = [p for p in paquetes if self._prep_es_nucleo(p)]
+        if nucleo:
+            self.log("✗ Lista rechazada: desactiva paquetes del núcleo de Android, y "
+                     "sin ellos la caja puede no volver a arrancar: "
+                     + ", ".join(nucleo) + ". No se cambió nada.")
+            return False
+        instalados = self._prep_lista()
+        previos = self._prep_lista("-d")
+        candidatos = []
+        for p in paquetes:
+            if p not in instalados:
+                self.log(f"  · {p}: no está en este equipo.")
+            elif p in previos:
+                self.log(f"  · {p}: ya venía desactivado; se deja como está.")
+            else:
+                candidatos.append(p)
+        plan = self._prep_salvaguardas(candidatos)
+        if not plan:
+            self.log("  Nada que desactivar.")
+            return True
+        if not self._prep_apuntar(plan):
+            return False
+        for nombre, grupo in lotes:
+            lote = [p for p in grupo if p in plan]
+            if lote:
+                self.log(f"  {nombre}:")
+                for p in lote:
+                    self._prep_desactivar(p)
+        ok = self._prep_comprobar(plan)
+        if self._prep.get("props", {}).get("ro.adb.secure") == "0":
+            self.log("  ⚠ Al terminar, cierra la depuración USB y por red (paso 7).")
+        return ok
+
+    def _prep_lanzador_worker(self, apk, componente, perfil, tema):
+        self.log(f"──── {PREP_TITULOS['lanzador']} ────")
+        pkg = componente.split("/")[0]
+        stock = perfil["lanzador_serie"].split("/")[0]
+        self.log(f"  {os.path.basename(apk)}   SHA-256 {self._prep_sha256(apk)}")
+        if not self._prep_instalar(apk, "lanzador"):
+            return False
+        if pkg not in self._prep_lista():
+            self.log(f"✗ Ese APK no instaló {pkg}: ¿es el lanzador correcto? No se toca "
+                     "el Home.")
+            return False
+        _, out, err = self.run_adb(
+            ["shell", f"cmd package set-home-activity --user 0 {componente}"],
+            timeout=30)
+        self.log(f"  set-home-activity: {(out + err).strip() or 'sin respuesta'}")
+        if not self._prep_abrir(componente):
+            self.log(f"✗ {pkg} no llegó a primer plano: el lanzador de serie se queda "
+                     "activo.")
+            return False
+        self._prep["lanzador"] = componente
+        if stock in self._prep_lista() and stock not in self._prep_lista("-d"):
+            dueno = self._prep_home_actual()
+            if dueno and dueno.split("/")[0] == stock:
+                self.log(f"  Home sigue en {stock}: su filtro HOME tiene más prioridad "
+                         "y «set-home-activity» no le gana. Hay que desactivarlo.")
+            plan = self._prep_salvaguardas([stock])
+            if not plan or not self._prep_apuntar(plan):
+                return False
+            self._prep_desactivar(stock)
+            if not self._prep_comprobar(plan):
+                return False
+        self.run_adb(["shell", "input keyevent 3"], timeout=15)
+        time.sleep(2)
+        delante = self._prep_delante()
+        if not self._prep_es(delante, pkg):
+            self.log(f"✗ Tras pulsar HOME no sale {pkg} ({', '.join(delante) or 'nada'})."
+                     f" Se reactiva {stock} para no dejar la caja sin Home.")
+            self.run_adb(["shell", f"pm enable {stock}"], timeout=30)
+            return False
+        self.log(f"✓ Home es {pkg}: comprobado pulsando HOME (mResumedActivity).")
+        if pkg == PREP_TEMA_PKG:
+            if tema:
+                self._prep_tema_worker(tema)
+        else:
+            if tema:
+                self._prep_fondo_flauncher(tema)
+            self.after(0, self._prep_ventana_guia)
+        return True
+
+    def _prep_senal_worker(self, apk, perfil):
+        self.log(f"──── {PREP_TITULOS['senal']} ────")
+        antes = self._prep_lista("-3")
+        if not self._prep_instalar(apk, "senal"):
+            return False
+        nuevos = sorted(self._prep_lista("-3") - antes)
+        if nuevos:
+            self.log(f"  Paquete nuevo: {', '.join(nuevos)}")
+            if self.tvbox_pkg not in nuevos:
+                self.log("  Si es tu app de señalización, escríbelo en la tarjeta del "
+                         f"TV Box (ahora pone {self.tvbox_pkg}).")
+        if not perfil:
+            return True
+        explorador = perfil["explorador"]
+        if explorador not in self._prep_lista():
+            self.log(f"  · {explorador} no está en esta caja.")
+        elif explorador in self._prep_lista("-d"):
+            _, out, err = self.run_adb(["shell", f"pm enable {explorador}"], timeout=30)
+            self.log(f"  {explorador}: {(out + err).strip() or 'sin respuesta'}")
+            if explorador in self._prep_lista("-d"):
+                self.log(f"✗ {explorador} sigue desactivado.")
+                return False
+            self.log(f"  ✓ Explorador de archivos reactivado ({explorador}).")
+        else:
+            self.log(f"  ✓ El explorador de archivos ({explorador}) ya está activo.")
+        return True
+
+    def _prep_reinicio_worker(self):
+        self.log(f"──── {PREP_TITULOS['reinicio']} ────")
+        carpeta = self._prep.get("carpeta")
+        aplicados = (self._prep_leer_paquetes(
+            os.path.join(carpeta, "lista-aplicada.txt")) if carpeta else [])
+        instalados = self._prep_lista()
+        esperado = self._prep.get("lanzador") or next(
+            (c for c in (PREP_TVHOME, PREP_FLAUNCHER) if c.split("/")[0] in instalados),
+            None)
+        self.log("  Reiniciando la caja...")
+        self.run_adb(["reboot"], timeout=30)
+        if not self._prep_esperar_arranque():
+            return False
+        self.log("  ✓ Arrancada (sys.boot_completed=1).")
+        ok = True
+        if aplicados:
+            desactivados = self._prep_lista("-d")
+            vueltos = [p for p in aplicados if p not in desactivados]
+            if vueltos:
+                self.log("✗ El firmware reactivó al arrancar: " + ", ".join(vueltos))
+                ok = False
+            else:
+                self.log(f"✓ Los {len(aplicados)} de la lista aplicada siguen "
+                         "desactivados.")
+        else:
+            self.log("  · Sin lista aplicada en esta sesión: no hay desactivados que "
+                     "comparar.")
+        home = self._prep_home_actual()
+        self.log(f"  Home: {home or '(sin resolver)'}")
+        if esperado:
+            pkg = esperado.split("/")[0]
+            self.run_adb(["shell", "input keyevent 3"], timeout=15)
+            time.sleep(2)
+            if (not home or home.split("/")[0] != pkg
+                    or not self._prep_es(self._prep_delante(), pkg)):
+                self.log(f"✗ Home ya no es {pkg}.")
+                ok = False
+            else:
+                self.log(f"✓ Home sigue siendo {pkg}.")
+        return ok
+
+    def _prep_cierre_worker(self, host, puerto=PREP_PUERTO):
+        self.log(f"──── {PREP_TITULOS['cierre']} ────")
+        self.run_adb(["disconnect", f"{host}:{puerto}"], target_device=False,
+                     timeout=15)
+        try:
+            with socket.create_connection((host, puerto), timeout=3):
+                pass
+        except ConnectionRefusedError:
+            self.log(f"✓ {host}:{puerto} rechaza la conexión: ADB por red está cerrado.")
+            return True
+        except socket.timeout:
+            self.log(f"✓ {host}:{puerto} no contestó en 3 s: cerrado, salvo que la caja "
+                     "esté apagada o en otra IP.")
+            return True
+        except OSError as e:
+            self.log(f"✗ No se pudo comprobar {host}:{puerto} ({e}). ¿Está encendida y "
+                     "en esta red?")
+            return False
+        self.log(f"✗ {host}:{puerto} sigue abierto: ADB por red está encendido. "
+                 "Desactiva la depuración USB y por red, reinicia y vuelve a comprobar.")
+        return False
+
+    def _prep_restaurar_worker(self, paquetes, home):
+        self.log("──── Restaurar desde una copia ────")
+        for p in paquetes:
+            _, out, err = self.run_adb(["shell", f"pm enable {p}"], timeout=30)
+            self.log(f"  {p}: {(out + err).strip() or 'sin respuesta'}")
+        if home:
+            _, out, err = self.run_adb(
+                ["shell", f"cmd package set-home-activity --user 0 {home}"], timeout=30)
+            self.log(f"  Home → {home}: {(out + err).strip() or 'sin respuesta'}")
+        desactivados = self._prep_lista("-d")
+        siguen = [p for p in paquetes if p in desactivados]
+        if siguen:
+            self.log("✗ Siguen desactivados: " + ", ".join(siguen))
+            return False
+        self.log("✓ Restaurado. Reinicia la caja y vuelve a cerrar la depuración.")
+        return True
 
     def _ask_text(self, title, prompt, default=""):
         dlg = ctk.CTkInputDialog(text=prompt, title=title)

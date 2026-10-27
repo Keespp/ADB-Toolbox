@@ -50,7 +50,8 @@ def correr():
         texto = boton.cget("text")
         anchos.add(fuente.measure(texto[:texto.index(nombre)]))
     r.check(len(anchos) == 1,
-            "el texto de las 10 secciones empieza en la misma columna "
+            "el texto de las %d secciones empieza en la misma columna "
+            % len(app.nav_buttons) +
             "(sólo emoji de ancho normal: 'ℹ️' mide 34 px y '🛠️' 47)")
 
     acciones = [n for n in dir(T.ADBToolbox) if n.startswith("action_")]

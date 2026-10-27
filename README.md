@@ -38,6 +38,7 @@ en este orden:
 | ⚡ **Energía** | Reiniciar, recovery, bootloader, apagar, pantalla ON/OFF |
 | 🌐 **Red** | Habilitar ADB por WiFi (puerto 5555), conectar por IP, **buscar dispositivos en la red** (escanea tu LAN y los conecta de golpe), emparejar por WiFi (Android 11+) |
 | 📺 **TV Box** | Signage p291: fix completo, fecha y hora, resolución, diagnóstico, reiniciar la app — [ver abajo](#sección-tv-box-signage-p291) |
+| ✅ **Preparar TV Box** | Asistente para dejar lista una caja nueva: copia de seguridad, desactivar el bloatware, lanzador y tema, app de señalización, reinicio y cierre de ADB, con restauración — [ver abajo](#preparar-tv-box-paso-a-paso) |
 
 ### Editar un XML del equipo
 
@@ -251,6 +252,150 @@ consola. La salida HDMI no persiste al reinicio; el framebuffer sí.
 > **Regla de oro:** ante cualquier `Unacceptable certificate` en estos boxes, compara
 > primero la fecha del equipo con la real.
 
+## Preparar TV Box (paso a paso)
+
+La limpieza de una caja de señalización recién sacada de la caja, en siete pasos que
+haces tú desde la app. Cada paso enseña antes lo que va a cambiar y espera tu
+confirmación; nada se desinstala, todo se **desactiva** (`pm disable-user`) y se
+deshace con **Restaurar desde una copia**.
+
+### Antes de empezar
+
+1. En la caja, con el mando: **Ajustes › Preferencias del dispositivo › Opciones para
+   desarrolladores** › activa **Depuración USB** y, si sale, **Depuración por red**.
+2. En la app: **Red / WiFi › Conectar por IP...** con la IP de la caja (o **Buscar
+   dispositivos en la red...**) y elígela arriba, en el selector.
+3. Si tienes Android Studio abierto, cierra su conexión (`adb disconnect <ip>:5555`):
+   las RK322x sólo aceptan **una** conexión ADB a la vez.
+4. Ten en el PC los archivos que vas a poner (no vienen con la app):
+   - **Lanzador**: el APK de `com.gathin.tvhome`, para cajas Android 8 o superior.
+   - **FLauncher**: `flauncher-0.18.0.apk` del GitLab oficial, para cajas Android 7.
+     La app comprueba su SHA-256
+     (`376fc528c880cdf7c7c04b2d3708c69f911144498218babb6300808b772af32e`) y, si no
+     coincide, te pregunta antes de usarlo.
+   - **Tema**: una carpeta con `config.json` y `wallpaper.jpg` para el lanzador.
+   - **Señalización**: el APK de tu app.
+
+   En la tarjeta de la página, **Elegir…** junto a cada uno. Se recuerdan para la
+   siguiente caja, así que en una flota sólo se eligen la primera vez.
+
+### Los pasos
+
+**Asistente completo** los hace todos en orden. En cada uno que cambia algo pregunta:
+**Sí** lo hace, **No** lo salta y sigue, **Cancelar** para el asistente. También puedes
+pulsar cada paso suelto; si hace falta identificar antes el equipo, lo hace solo.
+
+| Paso | Qué hace la app | Qué haces tú |
+|---|---|---|
+| **1 · Identificar equipo** | Lee `ro.product.device`, `ro.board.platform` y `ro.build.version.sdk` y elige el perfil. **Manda el SDK**: la ROM dice "Android 14" y miente. Avisa si `ro.adb.secure=0` y si hay un `su` setuid. Sólo lee | Mira en la tarjeta el modelo y el perfil |
+| **2 · Copia de seguridad** | Guarda en una carpeta por equipo (`copias-tvbox\<modelo>_<serie>\<fecha>`) la lista de paquetes (`-f -u -i`, `-d`, `-e`, `-s`, `-3`), `getprop`, los ajustes global/secure/system, el Home y sus candidatos, `wm size` y `wm density`. Sólo lee | Nada. La carpeta lleva el número de serie: **no la compartas** |
+| **3 · Desactivar bloatware** | Desactiva la lista del perfil con `pm disable-user --user 0`, **un paquete por llamada**, y lo comprueba con `pm list packages -d` (no se fía del código de salida). Antes apunta en la copia (`lista-aplicada.txt`) lo que va a desactivar | Confirmar |
+| **4 · Lanzador y tema** | Android 8+: instala el lanzador, lo pone de Home (`set-home-activity`), lo arranca con `am start -W` y **sólo si queda en primer plano** desactiva el de serie; pulsa HOME y comprueba que sale el nuevo. Después sube el tema. Android 7: lo mismo con FLauncher, deja el fondo en `Pictures/fondo-tvbox.jpg` y abre la guía del mando | Confirmar. En Android 7, seguir la guía de FLauncher (abajo) |
+| **5 · App de señalización** | La instala con push + `pm install -r` (`adb install` puede quedarse esperando una confirmación en la caja) y deja activo el explorador de archivos, para instalar APK desde un USB | Confirmar |
+| **6 · Reiniciar y verificar** | Reinicia, espera a `sys.boot_completed`, compara los desactivados con la lista aplicada (por si el firmware reactiva algo al arrancar) y comprueba que Home sigue siendo el lanzador nuevo | Confirmar y esperar uno o dos minutos |
+| **7 · Cerrar ADB y comprobar** | Te recuerda cerrar la depuración y, cuando lo hayas hecho, comprueba que el puerto 5555 **rechaza** la conexión | En la caja: Opciones para desarrolladores › desactiva Depuración USB y Depuración por red, reinicia, y responde **Sí** |
+
+Si un paso falla, el asistente se para y la consola dice por qué; arréglalo y sigue con
+el botón de ese paso. Un modelo **sin perfil** se queda en los pasos 1 y 2: inventario
+(en una tabla) y copia de seguridad, sin desactivar nada.
+
+### Modelos con perfil
+
+| Perfil | Se reconoce por | Lanzador | Explorador de archivos |
+|---|---|---|---|
+| Amlogic p291 (S905L2) | `p291` · `p291` · SDK 28 (Android 9) | `com.gathin.tvhome`; el de serie (`com.droidlogic.mboxlauncher`) tiene prioridad 30 en su filtro HOME y `set-home-activity` dice *Success* sin cambiar nada, por eso se desactiva | `com.droidlogic.FileBrower`, se reactiva en el paso 5 |
+| Rockchip RK322x (MXQ) | `rk322x_box` · `rk322x` · SDK 25 (Android 7.1) | FLauncher 0.18.0: el otro necesita SDK 26. El de serie es `com.ik.MXQ_Stick_MINI_8K` | `com.android.rockchip`, ya activo |
+
+Qué se desactiva en cada uno:
+
+- **p291**: limpiador de memoria, cajón de apps precargado, relleno de lanzador y
+  salvapantallas, cola de impresión, SMS push y sincronización de contactos; las apps de
+  sistema sospechosas (`com.abc.ninja`, con permisos para instalar, borrar y reiniciar),
+  el test de fábrica `com.ftest`, recomendaciones, una app IPTV con SDK de publicidad y un
+  receptor de cast; YouTube, Netflix, Prime Video, el ayudante de ratón de Netflix,
+  Chrome (aquí el WebView es `com.android.webview`) y la búsqueda por voz; reproductor,
+  galería y el actualizador OTA de este firmware `userdebug`.
+- **RK322x**: limpiador de memoria, cola de impresión, sincronización de calendario y
+  contactos, voz Pico; `com.yxotakeji.cdm` (arranca solo con permisos para instalar,
+  reiniciar y **borrar de fábrica**), `com.oranth.accessibility`, la tienda del
+  fabricante, Aptoide y el test de fábrica `com.DeviceTest`; YouTube, Netflix, Prime
+  Video, IPTV, Kodi, AirPin, Miracast y DLNA; el centro multimedia y la música.
+  **Chrome no se toca**: en esta caja es el proveedor de WebView.
+
+### Salvaguardas
+
+Van siempre, también con un perfil que alguien edite mal:
+
+- **Nunca** `pm uninstall`, ni root, ni flasheo.
+- Se rechaza entera, sin tocar nada, una lista con paquetes del núcleo de Android
+  (permissioncontroller, packageinstaller, ext.services/shared, modulemetadata,
+  overlay.modules, `com.android.providers.*` salvo calendario, contactos, diccionario y
+  números bloqueados, systemui, shell, phone, settings, tv.settings, `android`): sin
+  ellos la caja puede no volver a arrancar.
+- No se desactiva al **dueño de Home** si nadie más responde a HOME.
+- Se salta lo que pide `TV_INPUT_HARDWARE` (la capa bajo las entradas HDMI/AV) y el
+  **proveedor de WebView**.
+- Los paquetes de **fábrica** (`com.ftest`, `com.DeviceTest`…) se desactivan, pero la
+  app nunca los arranca.
+- Si tras pulsar HOME no sale el lanzador nuevo, se **reactiva** el de serie en el
+  momento, para no dejar la caja sin Home.
+- Sin copia de seguridad de esa caja, los pasos 3 y 4 no hacen nada.
+
+### FLauncher: lo que sólo se hace con el mando
+
+En las cajas Android 7 hay ajustes de FLauncher que no se pueden hacer por ADB. El
+botón con el icono de documento, arriba a la derecha de la página, abre esta guía; el
+paso 4 la abre solo:
+
+1. **Fondo**: Ajustes de FLauncher › Wallpaper › Custom › `Pictures/fondo-tvbox.jpg`.
+2. **Ocultar** Chrome, Descargas y el propio FLauncher: Ajustes › Applications › el ojo
+   tachado. Chrome se oculta, no se desactiva.
+3. **Categorías**: «Signage» arriba y «Herramientas» (explorador, Play Store, Ajustes).
+   Una app nueva no sale sola: Applications › botón [+] › su categoría.
+4. **Telemetría**: apaga *Crash Reporting* y *Analytics Reporting*.
+5. Lo que se escriba por ADB va **sin tildes ni ñ**: en Android 7 `input text` no las
+   admite. Se corrige con el mando en Categories › ⚙ › lápiz.
+
+### Restaurar desde una copia
+
+Con la depuración activada otra vez: **Restaurar desde una copia**, elige la carpeta de
+la copia de esa caja (las de `copias-tvbox`, también en **Ajustes › Copias del TV Box ›
+Abrir**). Reactiva con `pm enable`, uno por llamada, todo lo de su `lista-aplicada.txt`
+—incluido el lanzador de serie— y devuelve el Home al de serie. Lo que ya venía
+desactivado de fábrica se queda como estaba. Después reinicia la caja y vuelve a cerrar
+la depuración.
+
+Para reactivar **una sola** app basta la barra de comandos de abajo:
+`shell pm enable com.google.android.youtube.tv`.
+
+### Lo mismo con adb a mano
+
+Por si toca hacerlo sin la app; es lo que ella manda, en el mismo orden (`<ip>` es la de
+la caja, y cada `pm` va en su propia llamada):
+
+```bat
+adb connect <ip>:5555
+adb -s <ip>:5555 shell getprop ro.product.device
+adb -s <ip>:5555 shell getprop ro.build.version.sdk
+adb -s <ip>:5555 shell pm list packages -f -u -i > paquetes-todos.txt
+adb -s <ip>:5555 shell pm list packages -d > paquetes-deshabilitados.txt
+adb -s <ip>:5555 shell cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME > home.txt
+adb -s <ip>:5555 shell pm disable-user --user 0 com.charon.rocketfly
+adb -s <ip>:5555 shell pm list packages -d
+adb -s <ip>:5555 push lanzador.apk /data/local/tmp/lanzador.apk
+adb -s <ip>:5555 shell pm install -r /data/local/tmp/lanzador.apk
+adb -s <ip>:5555 shell cmd package set-home-activity --user 0 com.gathin.tvhome/.MainActivity
+adb -s <ip>:5555 shell am start -W -n com.gathin.tvhome/.MainActivity
+adb -s <ip>:5555 shell pm disable-user --user 0 com.droidlogic.mboxlauncher
+adb -s <ip>:5555 shell input keyevent 3
+adb -s <ip>:5555 shell "dumpsys activity activities | grep mResumedActivity"
+adb -s <ip>:5555 reboot
+adb -s <ip>:5555 shell getprop sys.boot_completed
+```
+
+Las listas completas de cada perfil están en `PERFILES_TVBOX`, al principio de
+`adb_toolbox.py`. En Android 9 se mira `mResumedActivity`; `mFocusedApp` no existe.
+
 ## La interfaz
 
 Barra de título y herramientas en una sola pieza arriba, barra lateral con las secciones
@@ -340,6 +485,13 @@ equipo. Comprueban, entre otras cosas, que las reglas de campo del TV Box siguen
 (nunca `wm size reset`, comprobar `disp_cap` antes de cambiar la salida de video) y que
 ni el texto que envías al equipo ni el token de la app de señalización acaban escritos
 en la consola.
+
+Las de **Preparar TV Box** simulan una p291 y una RK322x con estado (paquetes,
+prioridades del filtro HOME, reinicio, instalación por push) y comprueban cada
+salvaguarda: nada se desinstala, un `pm` por llamada, la lista negra del núcleo, el
+dueño de Home, `TV_INPUT_HARDWARE`, el WebView de la RK322x, que el lanzador de serie
+sólo se desactiva con el nuevo en primer plano y que un modelo desconocido sólo hace
+inventario y copia.
 
 ## Ejecutar desde el código
 
