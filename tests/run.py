@@ -4,12 +4,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_dispositivo
+import test_impresora
 import test_interfaz
 import test_preparar
 import test_registros
 import test_tvbox
 
-MODULOS = [test_dispositivo, test_tvbox, test_registros, test_interfaz, test_preparar]
+MODULOS = [test_dispositivo, test_tvbox, test_registros, test_interfaz, test_preparar,
+           test_impresora]
 
 def main():
     fallos = []

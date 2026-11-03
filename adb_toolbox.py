@@ -8,6 +8,7 @@ import hashlib
 import shlex
 import shutil
 import socket
+import ipaddress
 import tempfile
 import threading
 import subprocess
@@ -406,6 +407,18 @@ OCUPACION_CRITICA = 0.90
 LOG_VENDOR_DIRS = ("/data/Syslog", "/sdcard/ylog")
 TMP_EQUIPO = "/data/local/tmp"
 
+IMPRESORA_PUERTO = 9100
+IMPRESORA_FABRICA = "192.168.123.100"
+IMPRESORA_TRAMA_IP = b"\x1f\x1b\x1f\xb2"
+IMPRESORA_CORTE = b"\x1dV\x42\x00"
+IMPRESORA_USB_GUID = (0x28D78FAD, 0x5A12, 0x11D1,
+                      (0xAE, 0x5B, 0x00, 0x00, 0xF8, 0x03, 0xA8, 0xC2))
+IMPRESORA_IOCTL_1284 = 0x220034
+IMPRESORA_PUERTOS_VIRTUALES = ("PORTPROMPT:", "NUL:", "XPSPORT:", "SHRFAX:", "FILE:")
+IMPRESORA_INTENTOS = 8
+IMPRESORA_LOTE_ARP = 16
+IMPRESORA_MANUAL = "Otra red (escribir a mano)"
+
 BATERIA_ESTADO = {"1": "desconocido", "2": "cargando", "3": "descargando",
                   "4": "sin cargar", "5": "llena"}
 BATERIA_SALUD = {"1": "desconocida", "2": "buena", "3": "sobrecalentada",
@@ -526,6 +539,58 @@ def image_to_clipboard(pil_image):
         user32.SetClipboardData(CF_DIB, h_global)
     finally:
         user32.CloseClipboard()
+
+def red_de(ip, mascara):
+    red = ipaddress.IPv4Network(f"{ip}/{mascara}", strict=False)
+    if str(red.netmask) != mascara or not 8 <= red.prefixlen <= 30:
+        raise ValueError(mascara)
+    return red
+
+def revisar_ip_impresora(ip, mascara, puerta):
+    try:
+        direccion = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return None, "La IP no es válida."
+    try:
+        red = red_de(ip, mascara)
+    except ValueError:
+        return None, "La máscara no es válida."
+    if direccion in (red.network_address, red.broadcast_address):
+        return None, f"{ip} es la dirección de red o de difusión de {red}."
+    if (direccion.is_loopback or direccion.is_multicast or direccion.is_link_local
+            or direccion.is_unspecified):
+        return None, f"{ip} no sirve para una impresora."
+    try:
+        enlace = ipaddress.IPv4Address(puerta)
+    except ValueError:
+        return None, "La puerta de enlace no es válida."
+    if enlace not in red:
+        return None, f"La puerta de enlace no está en la red {red}."
+    if enlace == direccion:
+        return None, "La IP y la puerta de enlace no pueden ser la misma."
+    return red, ""
+
+def trama_ip_xprinter(ip, mascara, puerta):
+    return IMPRESORA_TRAMA_IP + b"".join(
+        ipaddress.IPv4Address(x).packed for x in (ip, mascara, puerta))
+
+def ips_candidatas(red, evitar=(), cuantas=48):
+    alto = int(red.broadcast_address) - (5 if red.num_addresses > 16 else 1)
+    bajo = int(red.network_address) + 1
+    salida = []
+    for n in range(alto, bajo - 1, -1):
+        ip = str(ipaddress.IPv4Address(n))
+        if ip not in evitar:
+            salida.append(ip)
+        if len(salida) == cuantas:
+            break
+    return salida
+
+def ticket_ip(ip, mascara, puerta):
+    texto = ("ADB Toolbox\nIP de la impresora\n\n"
+             f"IP:      {ip}\nMascara: {mascara}\nPuerta:  {puerta}\n"
+             f"Puerto:  {IMPRESORA_PUERTO}\n\n\n\n")
+    return b"\x1b@" + texto.encode("ascii") + IMPRESORA_CORTE
 
 class ADBToolbox(ctk.CTk):
     def __init__(self):
@@ -802,6 +867,8 @@ class ADBToolbox(ctk.CTk):
                     ("Conectar por IP...", self.action_wifi_connect, A),
                     ("Buscar dispositivos en la red...", self.action_wifi_scan, A),
                     ("Emparejar por WiFi (Android 11+)...", self.action_wifi_pair, GR),
+                    ("Cambiar IP de impresora térmica (USB)...",
+                     self.action_impresora_ip, A),
                 ]),
                 ("tv", "TV Box", "tvbox"),
                 ("preparar", "Preparar TV Box", "tvprep"),
@@ -909,6 +976,7 @@ class ADBToolbox(ctk.CTk):
                     marco._scrollbar.grid_remove()
             except Exception:
                 pass
+        marco._scrollbar.configure(height=0)
         marco.bind("<Configure>", _ajustar, add="+")
         marco._parent_canvas.bind("<Configure>", _ajustar, add="+")
         marco.after(300, _ajustar)
@@ -3508,6 +3576,660 @@ class ADBToolbox(ctk.CTk):
                                  hover_color=COLOR_ACCENT_HOVER, text_color="#ffffff")
         conectar.grid(row=0, column=2, padx=6)
         refrescar_boton()
+
+    def action_impresora_ip(self):
+        if os.name != "nt":
+            self.log("✗ Cambiar la IP de una impresora sólo funciona en Windows.")
+            return
+        self._ventana_impresora_ip()
+
+    def _ventana_impresora_ip(self):
+        win = ctk.CTkToplevel(self)
+        win.title("IP de impresora térmica")
+        win.geometry("580x600")
+        win.minsize(540, 590)
+        win.configure(fg_color=COLOR_BG)
+        win.transient(self)
+        self._cromo_windows(win)
+        win.grab_set()
+        win.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(win, text="Cambiar la IP de una impresora térmica",
+                     font=self._fuente("titulo"), height=24, text_color=COLOR_TEXT
+                     ).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
+        ctk.CTkLabel(win, text="Xprinter y compatibles, enchufada por USB a este PC. "
+                               "Con el cable de red puesto, la app comprueba la IP "
+                               f"nueva e imprime un ticket con ella. De fábrica "
+                               f"traen {IMPRESORA_FABRICA}.",
+                     font=self._fuente("menudo"), text_color=COLOR_MUTED, anchor="w",
+                     justify="left", wraplength=540
+                     ).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 10))
+
+        def tarjeta(fila, titulo, arriba=0):
+            marco = ctk.CTkFrame(win, fg_color=COLOR_CARD, corner_radius=RADIO_TARJETA,
+                                 border_width=1, border_color=COLOR_BORDER)
+            marco.grid(row=fila, column=0, sticky="ew", padx=18, pady=(arriba, 0))
+            marco.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(marco, text=titulo, font=self._fuente("seccion"), height=18,
+                         text_color=COLOR_TEXT
+                         ).grid(row=0, column=0, columnspan=2, sticky="w",
+                                padx=14, pady=(10, 4))
+            return marco
+
+        estado = {"destinos": [], "elegido": None, "redes": {}, "red": None,
+                  "ip_pc": None, "valida": False, "ficha": 0, "libres": set(),
+                  "ocupadas": set(), "pausa": None, "buscando": False}
+
+        usb = tarjeta(2, "Impresora")
+        lista = ctk.CTkScrollableFrame(usb, fg_color="transparent", height=92)
+        lista.grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
+        lista.grid_columnconfigure(0, weight=1)
+        self._scroll_autohide(lista)
+        filas = []
+
+        def pintar_filas():
+            for i, b in enumerate(filas):
+                activa = i == estado["elegido"]
+                b.configure(fg_color=COLOR_ACCENT if activa else "transparent",
+                            hover_color=COLOR_ACCENT_HOVER if activa else COLOR_RAISED,
+                            text_color="#ffffff" if activa else COLOR_TEXT)
+
+        def elegir(i):
+            estado["elegido"] = i
+            pintar_filas()
+            refrescar_boton()
+
+        def poner_destinos(destinos):
+            if not win.winfo_exists():
+                return
+            for hijo in lista.winfo_children():
+                hijo.destroy()
+            filas.clear()
+            estado["destinos"] = destinos
+            estado["elegido"] = None
+            if not destinos:
+                ctk.CTkLabel(lista, text="No hay ninguna impresora. Enchúfala por USB, "
+                                         "enciéndela y pulsa ⟳.",
+                             font=self._fuente("dato"), text_color=COLOR_FAINT,
+                             anchor="w", height=24).grid(row=0, column=0, sticky="w",
+                                                         padx=6, pady=4)
+            for i, d in enumerate(destinos):
+                b = ctk.CTkButton(lista, text=d["nombre"], anchor="w", height=30,
+                                  font=self._fuente("cuerpo"), corner_radius=7,
+                                  command=lambda n=i: elegir(n))
+                b.grid(row=i, column=0, sticky="ew", pady=1)
+                filas.append(b)
+            pintar_filas()
+            refrescar_boton()
+
+        def buscar():
+            for hijo in lista.winfo_children():
+                hijo.destroy()
+            filas.clear()
+            estado["elegido"] = None
+            refrescar_boton()
+            ctk.CTkLabel(lista, text="Buscando impresoras…", font=self._fuente("dato"),
+                         text_color=COLOR_MUTED, anchor="w", height=24
+                         ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+
+            def w():
+                destinos = self._impresoras()
+                self.after(0, lambda: poner_destinos(destinos))
+            self.threaded(w)
+
+        self._boton_icono(usb, "refrescar", buscar, ayuda="Volver a buscar", tam=28
+                          ).grid(row=0, column=2, sticky="e", padx=10, pady=(8, 2))
+
+        datos = tarjeta(3, "Dirección nueva", arriba=10)
+
+        def etiqueta(texto, fila):
+            ctk.CTkLabel(datos, text=texto, text_color=COLOR_MUTED, anchor="w",
+                         font=self._fuente("dato"), width=130, height=20
+                         ).grid(row=fila, column=0, sticky="w", padx=(14, 10), pady=4)
+
+        etiqueta("Red del PC", 1)
+        red_var = tk.StringVar(value="Buscando…")
+        menu = ctk.CTkOptionMenu(datos, variable=red_var, values=["Buscando…"],
+                                 dynamic_resizing=False, height=30,
+                                 font=self._fuente("cuerpo"),
+                                 dropdown_fg_color=COLOR_CHROME,
+                                 command=lambda v: elegir_red(v))
+        menu.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=4)
+
+        variables = {}
+        for fila, (clave, texto) in enumerate((("ip", "IP de la impresora"),
+                                               ("mascara", "Máscara"),
+                                               ("puerta", "Puerta de enlace")), 2):
+            etiqueta(texto, fila)
+            variables[clave] = tk.StringVar()
+            ctk.CTkEntry(datos, textvariable=variables[clave], height=30,
+                         font=self._fuente("cuerpo")
+                         ).grid(row=fila, column=1, sticky="ew", padx=(0, 14), pady=4)
+
+        aviso = ctk.CTkLabel(datos, text="", font=self._fuente("menudo"), anchor="w",
+                             justify="left", wraplength=500, text_color=COLOR_MUTED,
+                             height=30)
+        aviso.grid(row=5, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 8))
+
+        def avisar(texto, color=COLOR_MUTED):
+            aviso.configure(text=texto, text_color=color)
+
+        def leer():
+            return tuple(variables[k].get().strip() for k in ("ip", "mascara", "puerta"))
+
+        def poner_redes(redes):
+            if not win.winfo_exists():
+                return
+            estado["redes"] = {}
+            for r in redes:
+                prefijo = red_de(r["ip"], r["mascara"]).prefixlen
+                texto = f"{r['ip']}/{prefijo}  ·  {r['nombre']}"
+                estado["redes"][texto[:52]] = r
+            valores = list(estado["redes"]) + [IMPRESORA_MANUAL]
+            menu.configure(values=valores)
+            red_var.set(valores[0])
+            elegir_red(valores[0])
+
+        def elegir_red(texto):
+            r = estado["redes"].get(texto)
+            estado["ficha"] += 1
+            estado["buscando"] = False
+            if not r:
+                estado["red"] = estado["ip_pc"] = None
+                revisar()
+                return
+            red = red_de(r["ip"], r["mascara"])
+            estado["red"], estado["ip_pc"] = red, r["ip"]
+            estado["buscando"] = True
+            puerta = r["puerta"] or str(red.network_address + 1)
+            variables["ip"].set("")
+            variables["mascara"].set(r["mascara"])
+            variables["puerta"].set(puerta)
+            avisar(f"Buscando una IP libre en {red}…")
+            ficha = estado["ficha"]
+
+            def w():
+                ip = self._ip_libre(red, {r["ip"], puerta})
+                self.after(0, lambda: poner_sugerida(ficha, ip))
+            self.threaded(w)
+
+        def poner_sugerida(ficha, ip):
+            if ficha != estado["ficha"] or not win.winfo_exists():
+                return
+            estado["buscando"] = False
+            if not ip:
+                avisar("No encontré ninguna IP libre al final de la red: escribe una.",
+                       COLOR_AMBER)
+                return
+            estado["libres"].add(ip)
+            variables["ip"].set(ip)
+            revisar()
+
+        def revisar():
+            if estado["pausa"]:
+                win.after_cancel(estado["pausa"])
+            estado["pausa"] = None
+            ip, mascara, puerta = leer()
+            red, error = revisar_ip_impresora(ip, mascara, puerta)
+            estado["valida"] = red is not None and ip != estado["ip_pc"]
+            refrescar_boton()
+            if estado["buscando"]:
+                return
+            if not ip:
+                avisar("Escribe la IP que va a tener la impresora." if estado["red"]
+                       else "Escribe la IP, la máscara y la puerta de enlace de la red "
+                            "donde va a quedar la impresora.")
+                return
+            if red is None:
+                avisar(error, COLOR_FAIL)
+                return
+            if ip == estado["ip_pc"]:
+                avisar(f"{ip} es la IP de este PC.", COLOR_FAIL)
+                return
+            pc = estado["red"]
+            if pc is None:
+                avisar(f"La impresora quedará en {red}. Desde este PC no se podrá "
+                       "comprobar si no está en esa red.")
+                return
+            if ipaddress.IPv4Address(ip) not in pc or red != pc:
+                avisar(f"Fuera de la red del PC ({pc}): la impresora la tomará, pero "
+                       "desde aquí no se podrá comprobar.", COLOR_AMBER)
+                return
+            if ip in estado["libres"]:
+                avisar(f"✓ {ip} está libre en {pc}.", COLOR_OK)
+                return
+            if ip in estado["ocupadas"]:
+                avisar(f"{ip} ya responde en la red: otro equipo, o la propia "
+                       "impresora si ya la tenía.", COLOR_AMBER)
+                return
+            avisar(f"Comprobando si {ip} está libre…")
+            ficha = estado["ficha"]
+
+            def w():
+                ocupada = self._ip_ocupada(ip)
+                self.after(0, lambda: poner_ocupacion(ficha, ip, ocupada))
+            self.threaded(w)
+
+        def poner_ocupacion(ficha, ip, ocupada):
+            if ficha != estado["ficha"] or not win.winfo_exists():
+                return
+            (estado["ocupadas"] if ocupada else estado["libres"]).add(ip)
+            if leer()[0] == ip:
+                revisar()
+
+        def programar(*_):
+            if estado["pausa"]:
+                win.after_cancel(estado["pausa"])
+            estado["pausa"] = win.after(450, revisar)
+
+        for v in variables.values():
+            v.trace_add("write", programar)
+
+        comprobar_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(win, variable=comprobar_var, checkbox_width=18,
+                        checkbox_height=18, font=self._fuente("dato"),
+                        text="Comprobarla por la red e imprimir un ticket con la IP"
+                        ).grid(row=4, column=0, sticky="w", padx=20, pady=(12, 0))
+
+        barra = ctk.CTkFrame(win, fg_color="transparent")
+        barra.grid(row=5, column=0, sticky="ew", padx=18, pady=16)
+        barra.grid_columnconfigure(0, weight=1)
+
+        def refrescar_boton():
+            listo = estado["elegido"] is not None and estado["valida"]
+            cambiar.configure(state="normal" if listo else "disabled",
+                              fg_color=COLOR_ACCENT if listo else COLOR_BISEL)
+
+        def confirmar():
+            if estado["elegido"] is None:
+                return
+            ip, mascara, puerta = leer()
+            red, error = revisar_ip_impresora(ip, mascara, puerta)
+            if red is None or ip == estado["ip_pc"]:
+                revisar()
+                return
+            pc = estado["red"]
+            en_red = pc is not None and red == pc
+            if pc is not None and not en_red and not messagebox.askyesno(
+                    "Fuera de la red del PC",
+                    f"{ip} no está en la red de este PC ({pc}).\n\nLa impresora la "
+                    "tomará, pero desde aquí no se podrá comprobar ni imprimir en "
+                    "ella. ¿Seguir?", parent=win):
+                return
+            if ip in estado["ocupadas"] and not messagebox.askyesno(
+                    "IP en uso",
+                    f"Algo responde ya en {ip}. Si no es la propia impresora, habrá "
+                    "dos equipos con la misma IP. ¿Usarla igual?", parent=win):
+                return
+            destino = estado["destinos"][estado["elegido"]]
+            comprobar = comprobar_var.get() and en_red
+            win.destroy()
+            self.threaded(lambda: self._impresora_ip_worker(
+                destino, ip, mascara, puerta, comprobar))
+
+        self._styled_button(barra, "Cancelar", win.destroy, "muted", height=34
+                            ).grid(row=0, column=1, padx=(0, 8))
+        cambiar = self._styled_button(barra, "Cambiar IP", confirmar, "primary",
+                                      height=34)
+        cambiar.grid(row=0, column=2)
+        refrescar_boton()
+
+        buscar()
+
+        def w_redes():
+            try:
+                redes = self._interfaces_red()
+            except Exception as e:
+                self.log(f"⚠ No se pudo leer la red del PC: {e}")
+                redes = []
+            self.after(0, lambda: poner_redes(redes))
+        self.threaded(w_redes)
+        return win
+
+    def _impresora_ip_worker(self, destino, ip, mascara, puerta, comprobar=True):
+        self.log("──── IP de la impresora ────")
+        self.log(f"{destino['nombre']}: IP {ip} · máscara {mascara} · puerta {puerta}")
+        try:
+            self._impresora_escribir(destino, trama_ip_xprinter(ip, mascara, puerta))
+        except OSError as e:
+            self.log(f"✗ No se pudo escribir en la impresora: {e}. Comprueba que está "
+                     "encendida y enchufada; si estaba imprimiendo, espera y repite.")
+            return False
+        self.log("✓ IP enviada. Las Xprinter la toman al momento, sin reiniciar.")
+        if not comprobar:
+            self.log(f"Para comprobarla, conéctale el cable de red: debe responder en "
+                     f"{ip}:{IMPRESORA_PUERTO}.")
+            return True
+        self._progress_show(f"Esperando a la impresora en {ip}…")
+        try:
+            for _ in range(IMPRESORA_INTENTOS):
+                try:
+                    self._impresora_tcp(ip, ticket_ip(ip, mascara, puerta))
+                except OSError:
+                    time.sleep(1)
+                    continue
+                self.log(f"✓ Responde en {ip}:{IMPRESORA_PUERTO} y ha impreso el "
+                         "ticket con su IP.")
+                return True
+        finally:
+            self._progress_hide()
+        self.log(f"✗ No responde en {ip}:{IMPRESORA_PUERTO}. Comprueba que su cable de "
+                 "red va a esta red y apágala y enciéndela: algunos modelos sólo aplican "
+                 "la IP al reiniciar. La autoprueba (FEED pulsado al encender) imprime "
+                 "la IP que tiene; si sigue en la antigua, ese modelo no entiende el "
+                 "comando de Xprinter.")
+        return False
+
+    def _ip_libre(self, red, evitar):
+        candidatas = ips_candidatas(red, evitar)
+        for i in range(0, len(candidatas), IMPRESORA_LOTE_ARP):
+            lote = candidatas[i:i + IMPRESORA_LOTE_ARP]
+            with ThreadPoolExecutor(max_workers=len(lote)) as ex:
+                ocupadas = list(ex.map(self._ip_ocupada, lote))
+            for ip, ocupada in zip(lote, ocupadas):
+                if not ocupada:
+                    return ip
+        return None
+
+    def _interfaces_red(self):
+        import ctypes
+
+        class Direccion(ctypes.Structure):
+            pass
+        Direccion._fields_ = [("siguiente", ctypes.POINTER(Direccion)),
+                              ("ip", ctypes.c_char * 16),
+                              ("mascara", ctypes.c_char * 16),
+                              ("contexto", ctypes.c_ulong)]
+
+        class Adaptador(ctypes.Structure):
+            pass
+        Adaptador._fields_ = [
+            ("siguiente", ctypes.POINTER(Adaptador)), ("combo", ctypes.c_ulong),
+            ("nombre_interno", ctypes.c_char * 260), ("descripcion", ctypes.c_char * 132),
+            ("largo_mac", ctypes.c_uint), ("mac", ctypes.c_ubyte * 8),
+            ("indice", ctypes.c_ulong), ("tipo", ctypes.c_uint),
+            ("dhcp", ctypes.c_uint), ("actual", ctypes.POINTER(Direccion)),
+            ("ips", Direccion), ("puertas", Direccion), ("servidor_dhcp", Direccion),
+            ("wins", ctypes.c_int), ("wins1", Direccion), ("wins2", Direccion),
+            ("concesion", ctypes.c_int64), ("caducidad", ctypes.c_int64)]
+
+        iphlpapi = ctypes.WinDLL("iphlpapi")
+        tam = ctypes.c_ulong(0)
+        iphlpapi.GetAdaptersInfo(None, ctypes.byref(tam))
+        if not tam.value:
+            return []
+        buf = ctypes.create_string_buffer(tam.value)
+        if iphlpapi.GetAdaptersInfo(buf, ctypes.byref(tam)) != 0:
+            return []
+        salida = []
+        nodo = ctypes.cast(buf, ctypes.POINTER(Adaptador))
+        while nodo:
+            a = nodo.contents
+            puerta = a.puertas.ip.decode("ascii", "ignore")
+            nombre = a.descripcion.decode("mbcs", "replace")
+            d = a.ips
+            while True:
+                ip = d.ip.decode("ascii", "ignore")
+                mascara = d.mascara.decode("ascii", "ignore")
+                if ip and not ip.startswith(("0.", "127.", "169.254.")):
+                    try:
+                        red_de(ip, mascara)
+                        salida.append({"nombre": nombre, "ip": ip, "mascara": mascara,
+                                       "puerta": "" if puerta in ("", "0.0.0.0")
+                                       else puerta})
+                    except ValueError:
+                        pass
+                if not d.siguiente:
+                    break
+                d = d.siguiente.contents
+            nodo = a.siguiente
+        return sorted(salida, key=lambda r: not r["puerta"])
+
+    def _ip_ocupada(self, ip):
+        import ctypes
+        try:
+            sendarp = ctypes.WinDLL("iphlpapi").SendARP
+            sendarp.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_ulong)]
+            mac = (ctypes.c_ubyte * 8)()
+            largo = ctypes.c_ulong(8)
+            destino = int.from_bytes(socket.inet_aton(ip), "little")
+            return sendarp(destino, 0, mac, ctypes.byref(largo)) == 0
+        except Exception:
+            return False
+
+    def _impresoras(self):
+        destinos = []
+        for buscar in (self._impresoras_usb, self._impresoras_cola):
+            try:
+                destinos += buscar()
+            except Exception as e:
+                self.log(f"⚠ No se pudieron listar las impresoras: {e}")
+        return destinos
+
+    @staticmethod
+    def _kernel32():
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.HANDLE]
+        k.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+                                      wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                      ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        return k
+
+    def _usb_abrir(self, k, ruta):
+        import ctypes
+        h = k.CreateFileW(ruta, 0xC0000000, 3, None, 3, 0, None)
+        if not h or h == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return h
+
+    def _impresoras_usb(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class Guid(ctypes.Structure):
+            _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD),
+                        ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
+
+        class Interfaz(ctypes.Structure):
+            _fields_ = [("tam", wintypes.DWORD), ("guid", Guid),
+                        ("banderas", wintypes.DWORD), ("reservado", ctypes.c_size_t)]
+
+        class Dispositivo(ctypes.Structure):
+            _fields_ = [("tam", wintypes.DWORD), ("guid", Guid),
+                        ("instancia", wintypes.DWORD), ("reservado", ctypes.c_size_t)]
+
+        setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+        setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+        setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(Guid), wintypes.LPCWSTR,
+                                                  wintypes.HWND, wintypes.DWORD]
+        setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(Guid), wintypes.DWORD,
+            ctypes.POINTER(Interfaz)]
+        setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(Interfaz), ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(Dispositivo), wintypes.DWORD,
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+        setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+        def propiedad(disp, clave):
+            texto = ctypes.create_unicode_buffer(256)
+            if setupapi.SetupDiGetDeviceRegistryPropertyW(
+                    lista, ctypes.byref(disp), clave, None, texto,
+                    ctypes.sizeof(texto), None):
+                return texto.value.strip()
+            return ""
+
+        d1, d2, d3, d4 = IMPRESORA_USB_GUID
+        guid = Guid(d1, d2, d3, (ctypes.c_ubyte * 8)(*d4))
+        lista = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, 0x12)
+        if not lista or lista == ctypes.c_void_p(-1).value:
+            return []
+        rutas = []
+        try:
+            i = 0
+            while True:
+                dato = Interfaz(tam=ctypes.sizeof(Interfaz))
+                if not setupapi.SetupDiEnumDeviceInterfaces(
+                        lista, None, ctypes.byref(guid), i, ctypes.byref(dato)):
+                    break
+                i += 1
+                tam = wintypes.DWORD(0)
+                setupapi.SetupDiGetDeviceInterfaceDetailW(
+                    lista, ctypes.byref(dato), None, 0, ctypes.byref(tam), None)
+                if not tam.value:
+                    continue
+                buf = ctypes.create_string_buffer(tam.value)
+                ctypes.c_uint32.from_buffer(buf).value = (
+                    8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6)
+                disp = Dispositivo(tam=ctypes.sizeof(Dispositivo))
+                if setupapi.SetupDiGetDeviceInterfaceDetailW(
+                        lista, ctypes.byref(dato), buf, tam, None, ctypes.byref(disp)):
+                    rutas.append((ctypes.wstring_at(ctypes.addressof(buf) + 4),
+                                  propiedad(disp, 0x0C) or propiedad(disp, 0x00)))
+        finally:
+            setupapi.SetupDiDestroyDeviceInfoList(lista)
+
+        salida = []
+        for ruta, pnp in rutas:
+            m = re.search(r"vid_([0-9a-f]{4})&pid_([0-9a-f]{4})", ruta, re.I)
+            usb = f" ({m.group(1)}:{m.group(2)})".upper() if m else ""
+            modelo = self._usb_1284(ruta) or pnp or "Impresora USB"
+            salida.append({"tipo": "usb", "ruta": ruta,
+                           "nombre": f"USB · {modelo}{usb}"})
+        return salida
+
+    def _usb_1284(self, ruta):
+        import ctypes
+        from ctypes import wintypes
+        k = self._kernel32()
+        try:
+            h = self._usb_abrir(k, ruta)
+        except OSError:
+            return ""
+        try:
+            buf = ctypes.create_string_buffer(1024)
+            leidos = wintypes.DWORD(0)
+            if not k.DeviceIoControl(h, IMPRESORA_IOCTL_1284, None, 0, buf, 1024,
+                                     ctypes.byref(leidos), None):
+                return ""
+            crudo = buf.raw[2:leidos.value].decode("latin-1", "replace")
+        finally:
+            k.CloseHandle(h)
+        campos = {}
+        for parte in crudo.split(";"):
+            if ":" in parte:
+                clave, valor = parte.split(":", 1)
+                campos[clave.strip().upper()] = valor.strip()
+        fabricante = campos.get("MFG") or campos.get("MANUFACTURER", "")
+        modelo = campos.get("MDL") or campos.get("MODEL", "")
+        return " ".join(x for x in (fabricante, modelo) if x)
+
+    def _impresoras_cola(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class Info5(ctypes.Structure):
+            _fields_ = [("cola", wintypes.LPWSTR), ("puerto", wintypes.LPWSTR),
+                        ("atributos", wintypes.DWORD), ("espera1", wintypes.DWORD),
+                        ("espera2", wintypes.DWORD)]
+
+        winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+        winspool.EnumPrintersW.argtypes = [
+            wintypes.DWORD, wintypes.LPWSTR, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD)]
+        necesita, cuantas = wintypes.DWORD(0), wintypes.DWORD(0)
+        winspool.EnumPrintersW(2, None, 5, None, 0, ctypes.byref(necesita),
+                               ctypes.byref(cuantas))
+        if not necesita.value:
+            return []
+        buf = ctypes.create_string_buffer(necesita.value)
+        if not winspool.EnumPrintersW(2, None, 5, buf, necesita, ctypes.byref(necesita),
+                                      ctypes.byref(cuantas)):
+            return []
+        infos = ctypes.cast(buf, ctypes.POINTER(Info5))
+        salida = []
+        for i in range(cuantas.value):
+            cola, puerto = infos[i].cola or "", infos[i].puerto or ""
+            if cola and puerto.upper() not in IMPRESORA_PUERTOS_VIRTUALES:
+                salida.append({"tipo": "cola", "cola": cola,
+                               "nombre": f"Windows · {cola} ({puerto})"})
+        return sorted(salida, key=lambda d: "(USB" not in d["nombre"].upper())
+
+    def _impresora_escribir(self, destino, datos):
+        if destino["tipo"] == "usb":
+            self._usb_escribir(destino["ruta"], datos)
+        else:
+            self._cola_escribir(destino["cola"], datos)
+
+    def _usb_escribir(self, ruta, datos):
+        import ctypes
+        from ctypes import wintypes
+        k = self._kernel32()
+        h = self._usb_abrir(k, ruta)
+        try:
+            escritos = wintypes.DWORD(0)
+            if not k.WriteFile(h, datos, len(datos), ctypes.byref(escritos), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if escritos.value != len(datos):
+                raise OSError(f"sólo se escribieron {escritos.value} de {len(datos)} bytes")
+        finally:
+            k.CloseHandle(h)
+
+    def _cola_escribir(self, cola, datos):
+        import ctypes
+        from ctypes import wintypes
+
+        class Documento(ctypes.Structure):
+            _fields_ = [("nombre", wintypes.LPWSTR), ("salida", wintypes.LPWSTR),
+                        ("tipo", wintypes.LPWSTR)]
+
+        winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+        winspool.OpenPrinterW.argtypes = [wintypes.LPWSTR,
+                                          ctypes.POINTER(wintypes.HANDLE),
+                                          ctypes.c_void_p]
+        winspool.StartDocPrinterW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                              ctypes.POINTER(Documento)]
+        winspool.WritePrinter.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                                          wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        for f in ("StartPagePrinter", "EndPagePrinter", "EndDocPrinter",
+                  "ClosePrinter"):
+            getattr(winspool, f).argtypes = [wintypes.HANDLE]
+
+        h = wintypes.HANDLE()
+        if not winspool.OpenPrinterW(cola, ctypes.byref(h), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            doc = Documento(APP_NAME, None, "RAW")
+            if not winspool.StartDocPrinterW(h, 1, ctypes.byref(doc)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                winspool.StartPagePrinter(h)
+                escritos = wintypes.DWORD(0)
+                ok = winspool.WritePrinter(h, datos, len(datos), ctypes.byref(escritos))
+                error = ctypes.get_last_error()
+                winspool.EndPagePrinter(h)
+                if not ok or escritos.value != len(datos):
+                    raise ctypes.WinError(error)
+            finally:
+                winspool.EndDocPrinter(h)
+        finally:
+            winspool.ClosePrinter(h)
+
+    def _impresora_tcp(self, ip, datos, timeout=2):
+        with socket.create_connection((ip, IMPRESORA_PUERTO), timeout=timeout) as s:
+            s.sendall(datos)
 
     def action_run_command(self):
         linea = self.cmd_var.get().strip()

@@ -36,7 +36,7 @@ en este orden:
 | 📋 **Registros** | Extraer el logcat completo, el de una app concreta o sólo los errores; traer los registros que el equipo guarda en disco; generar el bugreport de Android; limpiar el buffer |
 | 🛠️ **Desarrollador** | Límites de diseño, overdraw GPU, mostrar toques, ubicación del puntero, animaciones, no mantener actividades, permanecer activo al cargar, perfil de renderizado GPU (todos alternables ON/OFF) |
 | ⚡ **Energía** | Reiniciar, recovery, bootloader, apagar, pantalla ON/OFF |
-| 🌐 **Red** | Habilitar ADB por WiFi (puerto 5555), conectar por IP, **buscar dispositivos en la red** (escanea tu LAN y los conecta de golpe), emparejar por WiFi (Android 11+) |
+| 🌐 **Red** | Habilitar ADB por WiFi (puerto 5555), conectar por IP, **buscar dispositivos en la red** (escanea tu LAN y los conecta de golpe), emparejar por WiFi (Android 11+), **cambiar la IP de una impresora térmica** por USB — [ver abajo](#cambiar-la-ip-de-una-impresora-térmica) |
 | 📺 **TV Box** | Signage p291: fix completo, fecha y hora, resolución, diagnóstico, reiniciar la app — [ver abajo](#sección-tv-box-signage-p291) |
 | ✅ **Preparar TV Box** | Asistente para dejar lista una caja nueva: copia de seguridad, desactivar el bloatware, lanzador y tema, app de señalización, reinicio y cierre de ADB, con restauración — [ver abajo](#preparar-tv-box-paso-a-paso) |
 
@@ -179,6 +179,38 @@ lo busca sola por mDNS después de emparejar; si no lo encuentra, te lo pide.
 
 Necesita platform-tools 30 o superior; si el tuyo es más viejo, te lo dice en vez de
 fallar sin explicación.
+
+## Cambiar la IP de una impresora térmica
+
+**Red / WiFi → Cambiar IP de impresora térmica (USB)...** le pone una IP fija a la
+tarjeta de red de una impresora **Xprinter** o compatible, sin su herramienta. La
+impresora va enchufada **por USB a este PC** y la IP le llega por ahí, así que da igual
+en qué red esté ahora. De fábrica traen `192.168.123.100`.
+
+1. Enchufa la impresora por USB y enciéndela. Si puedes, ponle también el cable de red
+   hacia la red donde va a quedar: así la app puede comprobar el cambio.
+2. Elige la impresora en la lista. Salen las USB que Windows ve aunque no tengan driver
+   (con su modelo, o con el nombre que les da Windows y su VID:PID) y las impresoras
+   instaladas en Windows. No hay ninguna elegida de entrada: una terminal Android
+   enchufada por USB también puede salir, porque algunas (WizarPOS) enseñan su impresora
+   interna.
+3. **Red del PC**: la app lee la IP, la máscara y la puerta de enlace de cada tarjeta de
+   red del PC y propone para la impresora una IP **libre** de esa misma red, de la .250
+   hacia abajo; antes de proponerla comprueba por ARP que no la usa nadie. Puedes
+   escribir otra y te avisa si ya responde algo en ella. Con **Otra red (escribir a
+   mano)** pones la IP, la máscara y la puerta de cualquier red, por ejemplo la del local
+   del cliente.
+4. **Cambiar IP**. Si la IP queda en la red del PC y la casilla está marcada, la app
+   espera a que la impresora conteste en el puerto 9100 y le manda un ticket con su IP
+   nueva: si sale el ticket, está hecho.
+
+Si no contesta, revisa el cable de red y apágala y enciéndela: algunos modelos sólo
+aplican la IP al reiniciar. La autoprueba (FEED pulsado al encenderla) imprime la IP
+que tiene.
+
+Lo que se le manda es el comando de red de Xprinter (`1F 1B 1F B2` seguido de la IP,
+la máscara y la puerta, 4 bytes cada una), el mismo que usa su herramienta de Windows.
+Epson, Bixolon y otras marcas usan sus propios protocolos y no lo entienden.
 
 ## Permisos de una app
 
@@ -492,6 +524,11 @@ salvaguarda: nada se desinstala, un `pm` por llamada, la lista negra del núcleo
 dueño de Home, `TV_INPUT_HARDWARE`, el WebView de la RK322x, que el lanzador de serie
 sólo se desactiva con el nuevo en primer plano y que un modelo desconocido sólo hace
 inventario y copia.
+
+Las de la **impresora térmica** simulan una Xprinter que sólo cambia de IP si le llega
+el comando correcto y que por la red sólo contesta en la IP que tiene, y comprueban la
+IP libre propuesta, las IP, máscaras y puertas que se rechazan y los avisos de IP en uso
+y de otra red.
 
 ## Ejecutar desde el código
 
