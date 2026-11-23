@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 APP_NAME = "ADB Toolbox"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_VENDOR = "keesp"
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".adb_toolbox")
