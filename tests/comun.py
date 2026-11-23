@@ -31,7 +31,8 @@ def crear_app(serial="ABC123456789"):
     T.CONFIG_DIR = tempfile.mkdtemp(prefix="adbtoolbox_test_")
     T.CONFIG_FILE = os.path.join(T.CONFIG_DIR, "config.json")
     T.ADBToolbox.prompt_configure_adb = lambda self: None
-    T.ADBToolbox.refresh_devices = lambda self: None
+    T.ADBToolbox.refresh_devices = lambda self, elegir=None: None
+    T.ADBToolbox._vigilar_dispositivos = lambda self: None
     T.time.sleep = lambda s: None
 
     app = T.ADBToolbox()

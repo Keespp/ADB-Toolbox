@@ -11,6 +11,7 @@ import socket
 import ipaddress
 import tempfile
 import threading
+import queue
 import subprocess
 import datetime
 import posixpath
@@ -32,6 +33,7 @@ FILA_CARGANDO = "~cargando"
 XML_MAX = 1024 * 1024
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+WM_DROPFILES = 0x0233
 
 COLOR_BG = "#28282C"
 COLOR_CARD = "#1E1E22"
@@ -592,6 +594,302 @@ def ticket_ip(ip, mascara, puerta):
              f"Puerto:  {IMPRESORA_PUERTO}\n\n\n\n")
     return b"\x1b@" + texto.encode("ascii") + IMPRESORA_CORTE
 
+def ram_de_adb(salida_ps):
+    filas = (salida_ps or "").splitlines()
+    cabecera = filas[0].split() if filas else []
+    try:
+        c_pid, c_ppid, c_rss = (cabecera.index(c) for c in ("PID", "PPID", "RSS"))
+    except ValueError:
+        return None
+    procesos = {}
+    for fila in filas[1:]:
+        partes = fila.split()
+        if len(partes) <= max(c_pid, c_ppid, c_rss) + 1:
+            continue
+        try:
+            procesos[int(partes[c_pid])] = (int(partes[c_ppid]), int(partes[c_rss]),
+                                            posixpath.basename(partes[-1]))
+        except ValueError:
+            continue
+    raices = {pid for pid, (_, _, nombre) in procesos.items() if nombre == "adbd"}
+    if not raices:
+        return None
+    hijos = {}
+    for pid, (padre, _, _) in procesos.items():
+        hijos.setdefault(padre, []).append(pid)
+    propios = set()
+    for pid, (_, _, nombre) in procesos.items():
+        if nombre == "ps":
+            while pid in procesos and pid not in raices and pid not in propios:
+                propios.add(pid)
+                pid = procesos[pid][0]
+    total, pendientes, vistos = 0, list(raices), set()
+    while pendientes:
+        pid = pendientes.pop()
+        if pid in vistos:
+            continue
+        vistos.add(pid)
+        if pid not in propios:
+            total += procesos[pid][1]
+        pendientes.extend(hijos.get(pid, []))
+    return total
+
+def destino_de_soltar(hwnd, entra, sale, suelta):
+    import ctypes
+    from ctypes import wintypes
+    u32, shell, ole = (ctypes.WinDLL(n) for n in ("user32", "shell32", "ole32"))
+    LRESULT, HRESULT, DWORD = ctypes.c_ssize_t, ctypes.c_long, wintypes.DWORD
+    shell.DragQueryFileW.restype = wintypes.UINT
+    shell.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                     wintypes.LPWSTR, wintypes.UINT]
+    shell.DragFinish.argtypes = [ctypes.c_void_p]
+    shell.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+    poner = getattr(u32, "SetWindowLongPtrW", None) or u32.SetWindowLongW
+    poner.restype = ctypes.c_void_p
+    poner.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    u32.CallWindowProcW.restype = LRESULT
+    u32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                    wintypes.WPARAM, wintypes.LPARAM]
+    u32.ChangeWindowMessageFilterEx.argtypes = [wintypes.HWND, wintypes.UINT,
+                                                DWORD, ctypes.c_void_p]
+    ole.OleInitialize.argtypes = [ctypes.c_void_p]
+    ole.RegisterDragDrop.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    ole.RevokeDragDrop.argtypes = [wintypes.HWND]
+    ole.ReleaseStgMedium.argtypes = [ctypes.c_void_p]
+
+    def leer(hdrop):
+        rutas = []
+        for i in range(shell.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)):
+            largo = shell.DragQueryFileW(hdrop, i, None, 0) + 1
+            buf = ctypes.create_unicode_buffer(largo)
+            shell.DragQueryFileW(hdrop, i, buf, largo)
+            rutas.append(buf.value)
+        return rutas
+
+    PROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                              wintypes.WPARAM, wintypes.LPARAM)
+
+    def proc(h, msg, wp, lp):
+        if msg == WM_DROPFILES:
+            try:
+                rutas = leer(wp)
+                shell.DragFinish(wp)
+                suelta(rutas)
+            except Exception:
+                pass
+            return 0
+        return u32.CallWindowProcW(previo, h, msg, wp, lp)
+
+    procedimiento = PROC(proc)
+    previo = poner(hwnd, -4, ctypes.cast(procedimiento, ctypes.c_void_p))
+    if not previo:
+        return None
+    for mensaje in (WM_DROPFILES, 0x004A, 0x0049):
+        u32.ChangeWindowMessageFilterEx(hwnd, mensaje, 1, None)
+    shell.DragAcceptFiles(hwnd, True)
+
+    class FORMATETC(ctypes.Structure):
+        _fields_ = [("cfFormat", wintypes.WORD), ("ptd", ctypes.c_void_p),
+                    ("dwAspect", DWORD), ("lindex", wintypes.LONG), ("tymed", DWORD)]
+
+    class STGMEDIUM(ctypes.Structure):
+        _fields_ = [("tymed", DWORD), ("hGlobal", ctypes.c_void_p),
+                    ("pUnkForRelease", ctypes.c_void_p)]
+
+    PEDIR = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.POINTER(FORMATETC),
+                               ctypes.POINTER(STGMEDIUM))
+
+    def rutas_de(datos):
+        tabla = ctypes.cast(ctypes.cast(datos, ctypes.POINTER(ctypes.c_void_p))[0],
+                            ctypes.POINTER(ctypes.c_void_p))
+        formato = FORMATETC(15, None, 1, -1, 1)
+        medio = STGMEDIUM()
+        if PEDIR(tabla[3])(datos, ctypes.byref(formato), ctypes.byref(medio)) != 0:
+            return []
+        try:
+            return leer(medio.hGlobal)
+        finally:
+            ole.ReleaseStgMedium(ctypes.byref(medio))
+
+    efecto = [0]
+    IIDS = (bytes(8) + b"\xc0" + bytes(6) + b"\x46",
+            b"\x22\x01" + bytes(6) + b"\xc0" + bytes(6) + b"\x46")
+    PREGUNTA = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.POINTER(ctypes.c_void_p))
+    CUENTA = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+    ENTRA = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.c_void_p, DWORD,
+                               ctypes.c_int64, ctypes.POINTER(DWORD))
+    ENCIMA = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, DWORD, ctypes.c_int64,
+                                ctypes.POINTER(DWORD))
+    SALE = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p)
+
+    def pregunta(this, iid, salida):
+        if ctypes.string_at(iid, 16) in IIDS:
+            salida[0] = this
+            return 0
+        salida[0] = None
+        return -2147467262
+
+    def ole_entra(this, datos, teclas, punto, permitido):
+        try:
+            efecto[0] = 1 if entra(rutas_de(datos)) else 0
+        except Exception:
+            efecto[0] = 0
+        permitido[0] &= efecto[0]
+        return 0
+
+    def ole_encima(this, teclas, punto, permitido):
+        permitido[0] &= efecto[0]
+        return 0
+
+    def ole_sale(this):
+        try:
+            sale()
+        except Exception:
+            pass
+        return 0
+
+    def ole_suelta(this, datos, teclas, punto, permitido):
+        permitido[0] &= efecto[0]
+        try:
+            suelta(rutas_de(datos))
+        except Exception:
+            permitido[0] = 0
+        return 0
+
+    class TABLA(ctypes.Structure):
+        _fields_ = [("pregunta", PREGUNTA), ("sumar", CUENTA), ("restar", CUENTA),
+                    ("entra", ENTRA), ("encima", ENCIMA), ("sale", SALE),
+                    ("suelta", ENTRA)]
+
+    class DESTINO(ctypes.Structure):
+        _fields_ = [("tabla", ctypes.POINTER(TABLA))]
+
+    funciones = (PREGUNTA(pregunta), CUENTA(lambda this: 1), CUENTA(lambda this: 1),
+                 ENTRA(ole_entra), ENCIMA(ole_encima), SALE(ole_sale),
+                 ENTRA(ole_suelta))
+    tabla = TABLA(*funciones)
+    destino = DESTINO(ctypes.pointer(tabla))
+    con_ole = (ctypes.sizeof(ctypes.c_void_p) == 8
+               and ole.OleInitialize(None) in (0, 1)
+               and ole.RegisterDragDrop(hwnd, ctypes.byref(destino)) == 0)
+
+    def quitar():
+        if con_ole:
+            ole.RevokeDragDrop(hwnd)
+        poner(hwnd, -4, previo)
+
+    quitar.ole = con_ole
+    quitar.destino = destino
+    quitar.vivos = (procedimiento, funciones, tabla)
+    return quitar
+
+_DPI = {"reescalando": False}
+
+def _raton_pulsado():
+    if os.name != "nt":
+        return False
+    import ctypes
+    estado = ctypes.windll.user32.GetAsyncKeyState
+    return bool((estado(0x01) | estado(0x02)) & 0x8000)
+
+def _lienzo_update_idletasks(lienzo):
+    if not _DPI["reescalando"]:
+        tk.Misc.update_idletasks(lienzo)
+
+def _quitados_de_rejilla(rastreo, ventana):
+    quitados = set()
+    for orden in rastreo.window_widgets_dict.get(ventana, []):
+        widget = getattr(orden, "__self__", None)
+        try:
+            if (getattr(widget, "_last_geometry_manager_call", None)
+                    and not widget.winfo_manager()):
+                quitados.add(widget)
+        except tk.TclError:
+            pass
+    return quitados
+
+def _en_rama(widget, raices):
+    while widget is not None:
+        if widget in raices:
+            return True
+        widget = getattr(widget, "master", None)
+    return False
+
+def _aplicar_escala(rastreo, ventana, ordenes):
+    escala = rastreo.window_dpi_scaling_dict[ventana]
+    _DPI["reescalando"] = True
+    try:
+        for orden in ordenes:
+            orden(escala * rastreo.widget_scaling, escala * rastreo.window_scaling)
+        ventana.update_idletasks()
+    finally:
+        _DPI["reescalando"] = False
+
+def _reescalar_ventana(rastreo, ventana):
+    quitados = _quitados_de_rejilla(rastreo, ventana)
+    ordenes = [orden for orden in rastreo.window_widgets_dict[ventana]
+               if not _en_rama(getattr(orden, "__self__", None), quitados)]
+    for widget in quitados:
+        widget._dpi_pendiente = True
+    ventana.attributes("-alpha", 0.15)
+    try:
+        _aplicar_escala(rastreo, ventana, ordenes)
+    finally:
+        ventana.attributes("-alpha", 1)
+
+def _poner_al_dia(widget):
+    widget._dpi_pendiente = False
+    rastreo = ctk.ScalingTracker
+    ventana = rastreo.get_window_root_of_widget(widget)
+    if ventana not in rastreo.window_dpi_scaling_dict:
+        return
+    raiz = {widget}
+    quitados = _quitados_de_rejilla(rastreo, ventana) - raiz
+    ordenes = []
+    for orden in rastreo.window_widgets_dict.get(ventana, []):
+        hijo = getattr(orden, "__self__", None)
+        if _en_rama(hijo, raiz) and not _en_rama(hijo, quitados):
+            ordenes.append(orden)
+    _aplicar_escala(rastreo, ventana, ordenes)
+
+_rejilla_ctk = ctk.CTkBaseClass.grid
+
+def _rejilla_al_dia(widget, **kwargs):
+    if getattr(widget, "_dpi_pendiente", False):
+        _poner_al_dia(widget)
+    return _rejilla_ctk(widget, **kwargs)
+
+def _revisar_dpi(rastreo):
+    pausa = rastreo.update_loop_interval
+    for ventana in list(rastreo.window_widgets_dict):
+        try:
+            if not ventana.winfo_exists() or ventana.state() == "iconic":
+                continue
+            escala = rastreo.get_window_dpi_scaling(ventana)
+            if escala == rastreo.window_dpi_scaling_dict[ventana]:
+                continue
+            sitio = (ventana.winfo_rootx(), ventana.winfo_rooty())
+            if sitio == getattr(ventana, "_dpi_sitio", None) or _raton_pulsado():
+                continue
+            ventana._dpi_sitio = sitio
+            rastreo.window_dpi_scaling_dict[ventana] = escala
+            _reescalar_ventana(rastreo, ventana)
+            pausa = rastreo.loop_pause_after_new_scaling
+        except tk.TclError:
+            continue
+    for ventana in list(rastreo.window_widgets_dict):
+        try:
+            ventana.after(pausa, rastreo.check_dpi_scaling)
+            return
+        except Exception:
+            continue
+    rastreo.update_loop_running = False
+
+ctk.ScalingTracker.check_dpi_scaling = classmethod(_revisar_dpi)
+ctk.CTkCanvas.update_idletasks = _lienzo_update_idletasks
+ctk.CTkBaseClass.grid = _rejilla_al_dia
+
 class ADBToolbox(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -604,6 +902,17 @@ class ADBToolbox(ctk.CTk):
         self.scrcpy_path = find_scrcpy(self.cfg.get("scrcpy_path"))
         self.selected_serial = None
         self.device_map = {}
+        self._presentes = []
+        self._firma_dispositivos = None
+        self._firma_vista = None
+        self._vigia = None
+        self._vigilando = False
+        self._trabajos = 0
+        self._cerrojo = threading.Lock()
+        self.pagina_actual = None
+        self._info_carga = 0
+        self._arrastres = queue.Queue()
+        self._zona_quitar_id = None
 
         self.recording = False
         self._rec_proc = None
@@ -647,6 +956,7 @@ class ADBToolbox(ctk.CTk):
         self._build_header()
         self._build_body()
         self._build_log()
+        self._build_zona_soltar()
 
         self.log(f"{APP_NAME} v{APP_VERSION} de {APP_VENDOR} iniciado.")
         if self.adb_path:
@@ -655,6 +965,119 @@ class ADBToolbox(ctk.CTk):
         else:
             self.log("ADB no encontrado. Usa 'Configurar ADB' para localizar adb.exe.")
             self.after(400, self.prompt_configure_adb)
+        self.after(500, self._vigilar_dispositivos)
+        self._aceptar_soltados()
+
+    def destroy(self):
+        self._vigilando = False
+        self._vigia_parar()
+        quitar = getattr(self, "_soltar_quitar", None)
+        if quitar:
+            quitar()
+        super().destroy()
+
+    def _aceptar_soltados(self):
+        if os.name != "nt":
+            return
+        try:
+            self._soltar_quitar = destino_de_soltar(
+                self.winfo_id(), self._arrastre_entra,
+                lambda: self._arrastre_avisar("sale"),
+                lambda rutas: self._arrastre_avisar("suelta", rutas))
+        except Exception:
+            self._soltar_quitar = None
+
+    def _arrastre_entra(self, rutas):
+        modo = self._modo_arrastre(rutas)
+        self._arrastre_avisar("entra", rutas)
+        return modo == "listo"
+
+    def _arrastre_avisar(self, evento, rutas=None):
+        self._arrastres.put((evento, rutas))
+        threading.Thread(target=self._arrastre_desde_hilo, daemon=True).start()
+
+    def _arrastre_desde_hilo(self):
+        try:
+            self.after(0, self._arrastre_vaciar)
+        except RuntimeError:
+            pass
+
+    def _arrastre_vaciar(self):
+        while True:
+            try:
+                evento, rutas = self._arrastres.get_nowait()
+            except queue.Empty:
+                return
+            self._arrastre(evento, rutas)
+
+    def _modo_arrastre(self, rutas):
+        if not [r for r in rutas if r.lower().endswith(".apk") and os.path.isfile(r)]:
+            return "no_apk"
+        return "listo" if self.selected_serial else "sin_equipo"
+
+    def _arrastre(self, evento, rutas=None):
+        if evento == "entra":
+            if self._zona_quitar_id:
+                self.after_cancel(self._zona_quitar_id)
+                self._zona_quitar_id = None
+            self._zona_mostrar(rutas or [])
+        elif evento == "sale":
+            if not self._zona_quitar_id:
+                self._zona_quitar_id = self.after(150, self._zona_quitar)
+        elif evento == "suelta":
+            self._zona_quitar()
+            self._soltar_archivos(rutas or [])
+
+    def _build_zona_soltar(self):
+        self.zona_soltar = ctk.CTkFrame(
+            self.content, fg_color=COLOR_ACCENT_SOFT, corner_radius=RADIO_TARJETA,
+            border_width=2, border_color=COLOR_ACCENT)
+        interior = ctk.CTkFrame(self.zona_soltar, fg_color="transparent")
+        interior.place(relx=0.5, rely=0.5, anchor="center")
+        self._zona_icono = ctk.CTkLabel(interior, text="")
+        self._zona_icono.pack(pady=(0, 14))
+        self._zona_titulo = ctk.CTkLabel(interior, text="", height=26,
+                                         font=self._fuente("titulo"),
+                                         text_color=COLOR_TEXT)
+        self._zona_titulo.pack()
+        self._zona_detalle = ctk.CTkLabel(interior, text="", height=20,
+                                          font=self._fuente("cuerpo"),
+                                          text_color=COLOR_MUTED, wraplength=460)
+        self._zona_detalle.pack(pady=(6, 0))
+        self._zona_archivos = ctk.CTkLabel(interior, text="", font=self._fuente("menudo"),
+                                           text_color=COLOR_MUTED, justify="center")
+        self._zona_archivos.pack(pady=(12, 0))
+
+    def _zona_mostrar(self, rutas):
+        modo = self._modo_arrastre(rutas)
+        apks = [os.path.basename(r) for r in rutas
+                if r.lower().endswith(".apk") and os.path.isfile(r)]
+        listo = modo == "listo"
+        color = COLOR_ACCENT if listo else COLOR_RED
+        titulo, detalle = {
+            "listo": ("Suelta aquí para instalar", f"en {self.device_menu.get()}"),
+            "sin_equipo": ("No hay ningún equipo elegido",
+                           "Conecta uno o elígelo arriba antes de soltar el APK."),
+            "no_apk": ("Esto no es un APK", "Sólo se pueden instalar archivos .apk."),
+        }[modo]
+        nombres = apks[:4] + ([f"y {len(apks) - 4} más"] if len(apks) > 4 else [])
+        self.zona_soltar.configure(fg_color=COLOR_ACCENT_SOFT if listo else COLOR_CARD,
+                                   border_color=color)
+        self._zona_icono.configure(image=icono("paquete", 56, color))
+        self._zona_titulo.configure(text=titulo)
+        self._zona_detalle.configure(text=detalle)
+        self._zona_archivos.configure(text="\n".join(nombres))
+        self.zona_soltar.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.zona_soltar.tkraise()
+
+    def _zona_quitar(self):
+        if self._zona_quitar_id:
+            try:
+                self.after_cancel(self._zona_quitar_id)
+            except ValueError:
+                pass
+            self._zona_quitar_id = None
+        self.zona_soltar.place_forget()
 
     def _cromo_windows(self, ventana=None):
         if os.name != "nt":
@@ -820,7 +1243,8 @@ class ADBToolbox(ctk.CTk):
             ("Software", [
                 ("paquete", "Aplicaciones", [
                     ("Desinstalar app (APK)", self.action_uninstall, RD),
-                    ("Instalar APK", self.action_install, GR),
+                    ("Instalar APK   (o suéltalo en la ventana)",
+                     self.action_install, GR),
                     ("Extraer APK instalado", self.action_extract_apk, A),
                     ("Abrir app", self.action_open_app, A),
                     ("Permisos de una app", self.action_permissions, A),
@@ -1061,6 +1485,7 @@ class ADBToolbox(ctk.CTk):
             image=icono(ico, 16, color_texto) if ico else None, compound="left")
 
     def show_page(self, name):
+        self.pagina_actual = name
         for n, page in self.pages.items():
             activa = n == name
             if activa:
@@ -2191,22 +2616,25 @@ class ADBToolbox(ctk.CTk):
 
         self.info_labels = {}
         self.info_bars = {}
+        self.info_partes = {}
         self.info_tarjetas = []
         for titulo, fila, col, campos, barras in [
                 ("Dispositivo", 1, 0, ["Modelo", "Fabricante", "Serie",
-                                       "CID", "CPU"], False),
-                ("Batería", 1, 1, ["Nivel", "Estado", "Salud", "Temperatura"],
-                 False),
+                                       "CID", "CPU"], ()),
+                ("Batería", 1, 1, ["Nivel", "Estado", "Salud", "Temperatura"], ()),
                 ("Sistema", 2, 0, ["Android", "SDK", "Compilación",
-                                   "Encendido hace"], False),
-                ("Almacenamiento y memoria", 2, 1, ["/data", "RAM"], True),
-                ("Pantalla", 3, 0, ["Resolución", "Densidad"], False),
-                ("Red", 3, 1, ["WiFi", "Ethernet"], False)]:
-            self._info_card(cuerpo, titulo, fila - 1, col, campos, barras)
+                                   "Encendido hace"], ()),
+                ("Almacenamiento y memoria", 2, 1, ["/data", "RAM", "RAM de adb"],
+                 ("/data", "RAM")),
+                ("Pantalla", 3, 0, ["Resolución", "Densidad"], ()),
+                ("Red", 3, 1, ["WiFi", "Ethernet"], ())]:
+            self._info_card(cuerpo, titulo, fila - 1, col, campos, barras,
+                            partes={"RAM": "RAM de adb"})
             self.info_tarjetas.append((titulo, campos))
         return page
 
-    def _info_card(self, parent, titulo, fila, col, campos, barras=False):
+    def _info_card(self, parent, titulo, fila, col, campos, barras=(), partes=None):
+        partes = partes or {}
         card = ctk.CTkFrame(parent, fg_color=COLOR_BG, corner_radius=RADIO_TARJETA,
                             border_width=1, border_color=COLOR_BORDER_SOFT)
         card.grid(row=fila, column=col, sticky="new", pady=(0, 5),
@@ -2219,16 +2647,19 @@ class ADBToolbox(ctk.CTk):
         r = 1
         for i, campo in enumerate(campos):
             ultimo = i == len(campos) - 1
-            margen = (0, 0 if barras or not ultimo else 8)
-            ctk.CTkLabel(card, text=campo, text_color=COLOR_MUTED, anchor="w",
-                         height=20, font=ctk.CTkFont(size=12)
+            con_barra = campo in barras
+            margen = (0, 8 if ultimo and not con_barra else 0)
+            leyenda = campo in partes.values()
+            ctk.CTkLabel(card, text=campo, anchor="w", height=20,
+                         text_color=COLOR_ACCENT if leyenda else COLOR_MUTED,
+                         font=ctk.CTkFont(size=12)
                          ).grid(row=r, column=0, sticky="w",
                                 padx=(14, 6), pady=margen)
             valor = self._dato_copiable(card)
             valor.grid(row=r, column=1, sticky="ew", padx=(0, 8), pady=margen)
             self.info_labels[campo] = valor
             r += 1
-            if barras:
+            if con_barra:
                 barra = ctk.CTkProgressBar(card, height=8, corner_radius=4,
                                            fg_color=COLOR_CARD,
                                            progress_color=COLOR_GREEN)
@@ -2236,14 +2667,22 @@ class ADBToolbox(ctk.CTk):
                 barra.grid(row=r, column=0, columnspan=2, sticky="ew",
                            padx=14, pady=(2, 8 if ultimo else 5))
                 self.info_bars[campo] = barra
+                if campo in partes:
+                    self.info_partes[campo] = ctk.CTkFrame(
+                        card, width=8, height=8, corner_radius=4, border_width=0,
+                        fg_color=COLOR_ACCENT)
                 r += 1
 
-    def _info_set(self, campo, valor):
+    def _info_set(self, campo, valor, ficha=None):
         etiqueta = self.info_labels.get(campo)
         if etiqueta is None:
             return
         texto = str(valor).strip() if valor is not None else ""
-        self.after(0, lambda: self._poner_dato(etiqueta, texto or "—"))
+
+        def _():
+            if ficha is None or ficha == self._info_carga:
+                self._poner_dato(etiqueta, texto or "—")
+        self.after(0, _)
 
     def _info_copiar(self):
         if self.info_labels["Modelo"].get() in ("—", "…"):
@@ -2258,18 +2697,50 @@ class ADBToolbox(ctk.CTk):
         self.clipboard_append("\n\n".join(bloques))
         self.log("Información del dispositivo copiada al portapapeles.")
 
-    def _info_bar(self, campo, fraccion):
+    def _info_bar(self, campo, fraccion, ficha=None, parte=None):
         barra = self.info_bars.get(campo)
         if barra is None or fraccion is None:
             return
         valor = max(0.0, min(1.0, fraccion))
         color = (COLOR_RED if valor >= OCUPACION_CRITICA else
                  COLOR_AMBER if valor >= OCUPACION_AVISO else COLOR_GREEN)
+        if parte is not None:
+            parte = max(0.0, min(valor, parte))
 
         def _():
+            if ficha is not None and ficha != self._info_carga:
+                return
             barra.set(valor)
             barra.configure(progress_color=color)
+            self._info_parte(campo, valor, parte)
         self.after(0, _)
+
+    def _info_parte(self, campo, valor, parte):
+        tramo = self.info_partes.get(campo)
+        if tramo is None:
+            return
+        if not parte:
+            tramo.place_forget()
+            return
+        barra = self.info_bars[campo]
+        radio = barra._apply_widget_scaling(barra.cget("corner_radius"))
+        tk.Place.place_configure(
+            tramo, in_=barra, relx=valor, x=round(2 * radio * (1 - valor)), rely=0,
+            anchor="ne", relwidth=parte, relheight=1,
+            width=round(tramo._apply_widget_scaling(4)))
+
+    def _info_vaciar(self):
+        for etiqueta in self.info_labels.values():
+            self._poner_dato(etiqueta, "—")
+        for campo, barra in self.info_bars.items():
+            barra.set(0)
+            self._info_parte(campo, 0, None)
+
+    def _info_otro_equipo(self):
+        self._info_carga += 1
+        self._info_vaciar()
+        if self.selected_serial and self.pagina_actual == "Información":
+            self.action_info_refresh()
 
     @staticmethod
     def _ultimo_valor(texto):
@@ -2282,11 +2753,12 @@ class ADBToolbox(ctk.CTk):
     def action_info_refresh(self):
         if not (self.ensure_adb() and self.ensure_device()):
             return
-        for campo in self.info_labels:
-            self._info_set(campo, "…")
-        for barra in self.info_bars.values():
-            barra.set(0)
-        self.threaded(self._info_worker)
+        self._info_carga += 1
+        ficha = self._info_carga
+        self._info_vaciar()
+        for etiqueta in self.info_labels.values():
+            self._poner_dato(etiqueta, "…")
+        self.threaded(lambda: self._info_worker(ficha))
 
     def _getprops_all(self):
         _, out, _ = self.run_adb(["exec-out", "getprop"], timeout=30)
@@ -2325,39 +2797,51 @@ class ADBToolbox(ctk.CTk):
                 return f"{props[clave]}   ({clave})"
         return ""
 
-    def _info_worker(self):
+    def _ram_de_adb(self):
+        for orden in (["ps", "-A"], ["ps"]):
+            _, out, _ = self.run_adb(["exec-out"] + orden, timeout=25)
+            kb = ram_de_adb(out)
+            if kb is not None:
+                return kb
+        return None
+
+    def _info_worker(self, ficha=None):
+        poner = lambda campo, valor: self._info_set(campo, valor, ficha)
+        vigente = lambda: ficha is None or ficha == self._info_carga
         props = self._getprops_all()
 
-        self._info_set("Modelo", props.get("ro.product.model", ""))
-        self._info_set("Fabricante", props.get("ro.product.manufacturer", ""))
+        poner("Modelo", props.get("ro.product.model", ""))
+        poner("Fabricante", props.get("ro.product.manufacturer", ""))
 
         serie = self._primera_prop(props, PROPS_SERIE)
         if not serie:
             _, s, _ = self.run_adb(["get-serialno"], target_device=True, timeout=15)
             s = s.strip()
             serie = s if s and ":" not in s and s.lower() != "unknown" else ""
-        self._info_set("Serie", serie or "no disponible")
+        poner("Serie", serie or "no disponible")
 
         cid = self._buscar_cid(props)
-        self._info_set("CID", cid or "no disponible")
-        if not cid:
+        poner("CID", cid or "no disponible")
+        if not cid and vigente():
             self.log("· CID: este equipo no lo publica con un nombre conocido. "
                      "Búscalo con:  shell getprop | grep -i cid")
-        self._info_set("CPU", props.get("ro.product.cpu.abi", ""))
+        poner("CPU", props.get("ro.product.cpu.abi", ""))
 
         sdk = props.get("ro.build.version.sdk", "")
         real = SDK_A_ANDROID.get(sdk)
-        self._info_set("Android", props.get("ro.build.version.release", ""))
-        self._info_set("SDK", f"{sdk}   (Android {real})" if real else sdk)
-        self._info_set("Compilación",
-                       self._version_firmware(props)
-                       or self._primera_prop(props, PROPS_COMPILACION))
+        poner("Android", props.get("ro.build.version.release", ""))
+        poner("SDK", f"{sdk}   (Android {real})" if real else sdk)
+        poner("Compilación",
+              self._version_firmware(props)
+              or self._primera_prop(props, PROPS_COMPILACION))
         up = self._tv_cat("/proc/uptime")
         try:
-            self._info_set("Encendido hace", self._fmt_dur(float(up.split()[0])))
+            poner("Encendido hace", self._fmt_dur(float(up.split()[0])))
         except (ValueError, IndexError):
-            self._info_set("Encendido hace", "")
+            poner("Encendido hace", "")
 
+        if not vigente():
+            return
         _, bat, _ = self.run_adb(["exec-out", "dumpsys", "battery"], timeout=25)
         datos = {}
         for linea in bat.splitlines():
@@ -2365,29 +2849,31 @@ class ADBToolbox(ctk.CTk):
                 clave, valor = linea.split(":", 1)
                 datos[clave.strip()] = valor.strip()
         if datos.get("present") == "false":
-            self._info_set("Nivel", "sin batería")
+            poner("Nivel", "sin batería")
             for campo in ("Estado", "Salud", "Temperatura"):
-                self._info_set(campo, "—")
+                poner(campo, "—")
         else:
             nivel = datos.get("level", "")
-            self._info_set("Nivel", f"{nivel} %" if nivel else "")
-            self._info_set("Estado", BATERIA_ESTADO.get(datos.get("status", ""),
-                                                        datos.get("status", "")))
-            self._info_set("Salud", BATERIA_SALUD.get(datos.get("health", ""),
-                                                      datos.get("health", "")))
+            poner("Nivel", f"{nivel} %" if nivel else "")
+            poner("Estado", BATERIA_ESTADO.get(datos.get("status", ""),
+                                               datos.get("status", "")))
+            poner("Salud", BATERIA_SALUD.get(datos.get("health", ""),
+                                             datos.get("health", "")))
             temp = datos.get("temperature", "")
-            self._info_set("Temperatura",
-                           f"{int(temp) / 10:.1f} °C" if temp.isdigit() else "")
+            poner("Temperatura",
+                  f"{int(temp) / 10:.1f} °C" if temp.isdigit() else "")
 
+        if not vigente():
+            return
         _, df, _ = self.run_adb(
             ["exec-out", "sh", "-c", "df -h /data | tail -1"], timeout=25)
         partes = df.split()
         if len(partes) >= 5:
-            self._info_set("/data", f"{partes[-3]} libres de {partes[-5]}"
-                                    f"   ({partes[-2]} usado)")
+            poner("/data", f"{partes[-3]} libres de {partes[-5]}"
+                           f"   ({partes[-2]} usado)")
             usado = partes[-2].rstrip("%")
             if usado.isdigit():
-                self._info_bar("/data", int(usado) / 100.0)
+                self._info_bar("/data", int(usado) / 100.0, ficha)
         _, mem, _ = self.run_adb(["exec-out", "cat", "/proc/meminfo"], timeout=25)
         valores = {}
         for linea in mem.splitlines():
@@ -2403,21 +2889,33 @@ class ADBToolbox(ctk.CTk):
 
         total = gigas(valores.get("MemTotal", ""))
         libre = gigas(valores.get("MemAvailable", valores.get("MemFree", "")))
+        adb_kb = self._ram_de_adb() if vigente() else None
         if total and libre:
-            self._info_set("RAM", f"{libre:.1f} GB libres de {total:.1f} GB")
-            self._info_bar("RAM", 1 - libre / total)
+            poner("RAM", f"{libre:.1f} GB libres de {total:.1f} GB")
+            parte = adb_kb / (total * 1048576.0) if adb_kb else None
+            self._info_bar("RAM", 1 - libre / total, ficha, parte)
+        if adb_kb is None:
+            poner("RAM de adb", "no disponible")
+        else:
+            mb = adb_kb / 1024.0
+            cifra = f"{mb:.0f} MB" if mb >= 10 else f"{mb:.1f} MB"
+            if total:
+                cifra += f"   ({adb_kb / (total * 10485.76):.1f} % de la RAM)"
+            poner("RAM de adb", cifra)
 
+        if not vigente():
+            return
         _, size, _ = self.run_adb(["exec-out", "wm", "size"], timeout=25)
         _, dens, _ = self.run_adb(["exec-out", "wm", "density"], timeout=25)
-        self._info_set("Resolución", self._ultimo_valor(size))
-        self._info_set("Densidad", self._ultimo_valor(dens))
+        poner("Resolución", self._ultimo_valor(size))
+        poner("Densidad", self._ultimo_valor(dens))
 
         for campo, interfaz in (("WiFi", "wlan0"), ("Ethernet", "eth0")):
             _, out, _ = self.run_adb(
                 ["exec-out", "ip", "-f", "inet", "addr", "show", interfaz],
                 timeout=25)
             m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-            self._info_set(campo, m.group(1) if m else "no conectado")
+            poner(campo, m.group(1) if m else "no conectado")
 
     def _build_log(self):
         wrap = ctk.CTkFrame(self, fg_color=COLOR_CHROME, corner_radius=0)
@@ -2650,6 +3148,8 @@ class ADBToolbox(ctk.CTk):
         return codigo, "\n".join(l for l in lineas if l)
 
     def threaded(self, fn):
+        with self._cerrojo:
+            self._trabajos += 1
         t = threading.Thread(target=self._safe_run, args=(fn,), daemon=True)
         t.start()
 
@@ -2658,20 +3158,25 @@ class ADBToolbox(ctk.CTk):
             fn()
         except Exception as e:
             self.log(f"✗ Error: {e}")
+        finally:
+            with self._cerrojo:
+                self._trabajos -= 1
 
-    def refresh_devices(self):
+    def _ocupado(self):
+        return self._tv_busy or self.recording or self._trabajos > 0
+
+    def refresh_devices(self, elegir=None):
         if not self.ensure_adb():
             return
         self.log("Buscando dispositivos...")
-        self.threaded(self._refresh_devices_worker)
+        self.threaded(lambda: self._refresh_devices_worker(elegir=elegir))
 
-    def _refresh_devices_worker(self):
-        code, out, err = self.run_adb(["devices", "-l"], target_device=False, timeout=15)
-        self.device_map = {}
-        labels = []
-        for line in out.splitlines()[1:]:
+    @staticmethod
+    def _leer_dispositivos(salida):
+        mapa, etiquetas, estados = {}, [], []
+        for line in salida.splitlines():
             line = line.strip()
-            if not line or "\t" not in line and " " not in line:
+            if not line or line.startswith(("List of devices", "*")):
                 continue
             parts = line.split()
             if len(parts) < 2:
@@ -2685,34 +3190,133 @@ class ADBToolbox(ctk.CTk):
                 label = f"{model or 'Dispositivo'}  ({serial})"
             else:
                 label = f"[{state}] {serial}"
-            self.device_map[label] = serial if state == "device" else None
-            labels.append(label)
+            mapa[label] = serial if state == "device" else None
+            etiquetas.append(label)
+            estados.append((serial, state))
+        return mapa, etiquetas, frozenset(estados)
 
-        def _update():
-            if labels:
-                self.device_menu.configure(values=labels)
-                sigue = next((l for l in labels
-                              if self.selected_serial
-                              and self.device_map.get(l) == self.selected_serial),
-                             None)
-                elegido = sigue or labels[0]
-                self.device_menu.set(elegido)
-                self.on_device_selected(elegido)
-                self.log(f"✓ {len(labels)} dispositivo(s) detectado(s).")
-            else:
-                self.device_menu.configure(values=["Sin dispositivos"])
-                self.device_menu.set("Sin dispositivos")
-                self.selected_serial = None
+    def _refresh_devices_worker(self, auto=False, elegir=None):
+        code, out, err = self.run_adb(["devices", "-l"], target_device=False, timeout=15)
+        if auto and code != 0:
+            return
+        mapa, etiquetas, firma = self._leer_dispositivos(out)
+        self.after(0, lambda: self._aplicar_dispositivos(
+            mapa, etiquetas, firma, auto, elegir))
+
+    def _aplicar_dispositivos(self, mapa, etiquetas, firma, auto=False, elegir=None):
+        primera = self._firma_dispositivos is None
+        anteriores = list(self._presentes)
+        estados_previos = dict(self._firma_dispositivos or ())
+        presentes = [mapa[e] for e in etiquetas if mapa[e]]
+        nuevos = [s for s in presentes if s not in anteriores]
+        self.device_map = mapa
+        self._presentes = presentes
+        self._firma_dispositivos = firma
+        self.device_menu.configure(values=etiquetas or ["Sin dispositivos"])
+        etiqueta_de = {s: e for e, s in mapa.items() if s}
+        actual = self.selected_serial
+
+        if auto and not primera:
+            for serial in nuevos:
+                self.log(f"＋ Conectado: {etiqueta_de[serial]}")
+            for serial in anteriores:
+                if serial not in presentes:
+                    self.log(f"－ Desconectado: {serial}")
+            for serial, estado in sorted(firma):
+                if estado == "unauthorized" and estados_previos.get(serial) != estado:
+                    self.log(f"⚠ {serial}: acepta la depuración USB en la pantalla "
+                             "del equipo.")
+            if self._ocupado() or actual in presentes:
+                self.set_status(actual in presentes)
+                return
+            if nuevos:
+                elegido = nuevos[0]
+            elif presentes:
                 self.set_status(False)
-                self.log("No se detectaron dispositivos. ¿Depuración USB activada?")
-        self.after(0, _update)
+                return
+            else:
+                elegido = None
+            texto = etiqueta_de.get(elegido) or (etiquetas[0] if etiquetas
+                                                  else "Sin dispositivos")
+            self.device_menu.set(texto)
+            self._elegir_dispositivo(elegido, texto)
+            return
+
+        if not etiquetas:
+            self.device_menu.set("Sin dispositivos")
+            self._elegir_dispositivo(None)
+            self.log("No se detectaron dispositivos. ¿Depuración USB activada?")
+            return
+        if elegir in presentes:
+            elegido = etiqueta_de[elegir]
+        elif actual in presentes:
+            elegido = etiqueta_de[actual]
+        else:
+            elegido = etiquetas[0]
+        self.device_menu.set(elegido)
+        self.on_device_selected(elegido)
+        self.log(f"✓ {len(etiquetas)} dispositivo(s) detectado(s).")
 
     def on_device_selected(self, label):
-        serial = self.device_map.get(label)
+        self._elegir_dispositivo(self.device_map.get(label), label)
+
+    def _elegir_dispositivo(self, serial, label=None):
+        anterior = self.selected_serial
         self.selected_serial = serial
         self.set_status(bool(serial))
         if serial:
-            self.log(f"Dispositivo activo: {label}")
+            self.log(f"Dispositivo activo: {label or serial}")
+        if serial != anterior:
+            self._info_otro_equipo()
+
+    def _vigilar_dispositivos(self):
+        self._vigilando = True
+        threading.Thread(target=self._vigia_bucle, daemon=True).start()
+
+    def _vigia_bucle(self):
+        while self._vigilando:
+            ruta = self.adb_path
+            if not ruta:
+                time.sleep(2)
+                continue
+            try:
+                proc = subprocess.Popen(
+                    [ruta, "track-devices"], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW)
+            except OSError:
+                time.sleep(5)
+                continue
+            self._vigia = proc
+            try:
+                while self._vigilando:
+                    cabeza = proc.stdout.read(4)
+                    if len(cabeza) < 4:
+                        break
+                    largo = int(cabeza, 16)
+                    datos = proc.stdout.read(largo) if largo else b""
+                    self._vigia_aviso(datos.decode("utf-8", "replace"))
+            except Exception:
+                pass
+            finally:
+                self._vigia_parar()
+            if self._vigilando:
+                time.sleep(3)
+
+    def _vigia_aviso(self, texto):
+        firma = self._leer_dispositivos(texto)[2]
+        if firma == self._firma_vista:
+            return
+        self._firma_vista = firma
+        self._refresh_devices_worker(auto=True)
+
+    def _vigia_parar(self):
+        proc, self._vigia = self._vigia, None
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def prompt_configure_adb(self):
         messagebox.showinfo(
@@ -2727,6 +3331,7 @@ class ADBToolbox(ctk.CTk):
             self.cfg["adb_path"] = path
             save_config(self.cfg)
             self.log(f"✓ ADB configurado: {path}")
+            self._vigia_parar()
             self.refresh_devices()
 
     def action_screenshot(self):
@@ -2977,8 +3582,10 @@ class ADBToolbox(ctk.CTk):
         self.log(f"Conectando a {destino} ...")
         _, out, err = self.run_adb(["connect", destino], target_device=False,
                                    timeout=30)
-        self.log("  " + (((out or "") + (err or "")).strip() or "sin respuesta"))
-        self.after(300, self.refresh_devices)
+        salida = ((out or "") + (err or "")).strip()
+        self.log("  " + (salida or "sin respuesta"))
+        elegir = destino if "connected" in salida.lower() else None
+        self.after(300, lambda: self.refresh_devices(elegir=elegir))
 
     def _puerto_de_conexion(self, ip):
         _, out, _ = self.run_adb(["mdns", "services"], target_device=False,
@@ -3331,19 +3938,49 @@ class ADBToolbox(ctk.CTk):
     def action_install(self):
         if not (self.ensure_adb() and self.ensure_device()):
             return
-        path = filedialog.askopenfilename(
-            title="Selecciona un APK", filetypes=[("APK", "*.apk"), ("Todos", "*.*")])
-        if not path:
+        rutas = filedialog.askopenfilenames(
+            title="Selecciona uno o varios APK",
+            filetypes=[("APK", "*.apk"), ("Todos", "*.*")])
+        if rutas:
+            self._instalar_apks(list(rutas))
+
+    def _soltar_archivos(self, rutas):
+        apks = [r for r in rutas if r.lower().endswith(".apk") and os.path.isfile(r)]
+        if not apks:
+            self.log("⚠ Sólo se instalan archivos .apk: lo que has soltado no lo es.")
             return
+        if len(apks) < len(rutas):
+            self.log(f"· Se ignoran {len(rutas) - len(apks)} elemento(s) que no son "
+                     "un archivo .apk.")
+        if not (self.ensure_adb() and self.ensure_device()):
+            return
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        nombres = "\n".join("  · " + os.path.basename(r) for r in apks)
+        if not messagebox.askyesno(
+                "Instalar APK",
+                f"¿Instalar en {self.device_menu.get()}?\n\n{nombres}", parent=self):
+            return
+        self._instalar_apks(apks)
+
+    def _instalar_apks(self, rutas):
         def _w():
-            nombre = os.path.basename(path)
-            self.log(f"Instalando {nombre}...")
-            code, salida = self.run_adb_transfer(["install", "-r", path],
-                                                 f"Instalando {nombre}", timeout=600)
-            if "Success" in salida:
-                self.log("✓ Instalación correcta.")
-            else:
-                self.log(f"✗ Error: {salida or 'sin detalle'}")
+            bien = 0
+            for i, ruta in enumerate(rutas, 1):
+                nombre = os.path.basename(ruta)
+                cuenta = f" ({i} de {len(rutas)})" if len(rutas) > 1 else ""
+                self.log(f"Instalando {nombre}{cuenta}...")
+                code, salida = self.run_adb_transfer(["install", "-r", ruta],
+                                                     f"Instalando {nombre}", timeout=600)
+                if "Success" in salida:
+                    bien += 1
+                    self.log("✓ Instalación correcta.")
+                else:
+                    self.log(f"✗ Error: {salida or 'sin detalle'}")
+            if len(rutas) > 1:
+                self.log(f"{'✓' if bien == len(rutas) else '✗'} Instalados {bien} de "
+                         f"{len(rutas)}.")
         self.threaded(_w)
 
     def action_reboot(self, mode=None):
@@ -3397,8 +4034,10 @@ class ADBToolbox(ctk.CTk):
             ip = ip + ":5555"
         def _w():
             code, out, err = self.run_adb(["connect", ip], target_device=False, timeout=25)
-            self.log((out or err).strip())
-            self.after(300, self.refresh_devices)
+            salida = (out or err).strip()
+            self.log(salida)
+            elegir = ip if "connected" in salida.lower() else None
+            self.after(300, lambda: self.refresh_devices(elegir=elegir))
         self.threaded(_w)
 
     def action_wifi_scan(self):
@@ -3495,7 +4134,7 @@ class ADBToolbox(ctk.CTk):
         return hall
 
     def _conectar_ips(self, ips, port=5555):
-        ok = 0
+        ok, elegir = 0, None
         for ip in ips:
             destino = ip if ":" in ip else "%s:%d" % (ip, port)
             _, out, err = self.run_adb(["connect", destino], target_device=False,
@@ -3504,8 +4143,9 @@ class ADBToolbox(ctk.CTk):
             self.log("  " + (salida or "sin respuesta"))
             if "connected" in salida.lower():
                 ok += 1
+                elegir = elegir or destino
         self.log("✓ Conectados %d de %d." % (ok, len(ips)))
-        self.after(300, self.refresh_devices)
+        self.after(300, lambda: self.refresh_devices(elegir=elegir))
 
     def _ventana_encontrados(self, ips, port=5555):
         conectados = {s.split(":")[0] for s in (self.device_map or {}).values() if s}

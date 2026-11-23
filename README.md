@@ -28,11 +28,11 @@ en este orden:
 
 | Sección | Botones |
 |---|---|
-| ℹ️ **Información** | Panel con modelo, serial, CID, número de compilación, Android, batería (nivel, salud, temperatura), almacenamiento libre y RAM **con barra de ocupación** (verde / ámbar / rojo según lo llena que esté), resolución, IP y tiempo encendido. Cada dato **se puede seleccionar y copiar** (Ctrl+C), y el botón de copiar se lleva la ficha entera |
+| ℹ️ **Información** | Panel con modelo, serial, CID, número de compilación, Android, batería (nivel, salud, temperatura), almacenamiento libre y RAM **con barra de ocupación** (verde / ámbar / rojo según lo llena que esté), resolución, IP y tiempo encendido. En la barra de RAM, **en azul, lo que ocupa adb** en el equipo (adbd y todo lo que se lanza por él, scrcpy incluido), con la cifra en **RAM de adb**. **Se carga sola** al elegir otro equipo o al conectar uno nuevo. Cada dato **se puede seleccionar y copiar** (Ctrl+C), y el botón de copiar se lleva la ficha entera |
 | 📸 **Capturas** | Captura de pantalla (guarda en carpeta **y** copia al portapapeles), grabar pantalla con inicio/parada manual, espejar en tiempo real (scrcpy), abrir carpeta |
 | 📁 **Archivos** | Explorar el equipo, enviar (push), traer (pull), eliminar y **editar los XML en el sitio** — [ver abajo](#editar-un-xml-del-equipo) |
 | 🎮 **Control remoto** | D-pad y OK, atrás, inicio, menú, recientes, volumen, silencio, play/pausa, encendido, y un campo que escribe en el equipo lo que teclees en el PC |
-| 📦 **Aplicaciones** | Desinstalar APK (**incluidas las que son administrador de dispositivos**), instalar APK, extraer el APK instalado, abrir una app, ver y cambiar sus permisos, **listar las apps con su versión** (solo las tuyas o todas, incluidas las del sistema), forzar detención, borrar datos |
+| 📦 **Aplicaciones** | Desinstalar APK (**incluidas las que son administrador de dispositivos**), instalar uno o varios APK (**o soltarlos en la ventana desde el Explorador**, en cualquier sección: al pasar por encima, el panel se vuelve una zona de soltar que dice en qué equipo se instalará, o en rojo por qué no se puede, y al soltar pide confirmación), extraer el APK instalado, abrir una app, ver y cambiar sus permisos, **listar las apps con su versión** (solo las tuyas o todas, incluidas las del sistema), forzar detención, borrar datos |
 | 📋 **Registros** | Extraer el logcat completo, el de una app concreta o sólo los errores; traer los registros que el equipo guarda en disco; generar el bugreport de Android; limpiar el buffer |
 | 🛠️ **Desarrollador** | Límites de diseño, overdraw GPU, mostrar toques, ubicación del puntero, animaciones, no mantener actividades, permanecer activo al cargar, perfil de renderizado GPU (todos alternables ON/OFF) |
 | ⚡ **Energía** | Reiniciar, recovery, bootloader, apagar, pantalla ON/OFF |
@@ -296,7 +296,7 @@ deshace con **Restaurar desde una copia**.
 1. En la caja, con el mando: **Ajustes › Preferencias del dispositivo › Opciones para
    desarrolladores** › activa **Depuración USB** y, si sale, **Depuración por red**.
 2. En la app: **Red / WiFi › Conectar por IP...** con la IP de la caja (o **Buscar
-   dispositivos en la red...**) y elígela arriba, en el selector.
+   dispositivos en la red...**). Queda elegida arriba, en el selector.
 3. Si tienes Android Studio abierto, cierra su conexión (`adb disconnect <ip>:5555`):
    las RK322x sólo aceptan **una** conexión ADB a la vez.
 4. Ten en el PC los archivos que vas a poner (no vienen con la app):
@@ -493,7 +493,13 @@ La app usa su propio `adb` para lanzarlo y evitar conflictos de versión.
 
 1. Conecta el teléfono por USB.
 2. Abre `ADB_Toolbox.exe`.
-3. Pulsa **⟳** para detectar dispositivos y selecciónalo en la lista superior.
+3. El equipo aparece solo en la lista superior: la app vigila las conexiones y
+   desconexiones (también las de red) y lo avisa en la consola. **⟳** fuerza a buscar
+   de nuevo.
+   - Si no había ningún equipo elegido, o el elegido se desconectó, el que conectes
+     **queda elegido**. Si ya trabajas con otro que sigue conectado, el nuevo sólo se
+     añade a la lista: elígelo tú. Con una operación en marcha nunca se cambia de equipo.
+   - Lo que conectes con **Conectar por IP...** queda elegido siempre.
    - El punto se pone **verde** cuando hay un dispositivo activo.
 4. Pulsa el botón de la acción deseada. La salida aparece en la **Consola** inferior.
 

@@ -26,9 +26,29 @@ PKG:com.app.sinversion
     versionCode=7 minSdk=21 targetSdk=29
 """
 
+PS_TOYBOX = """USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME
+root             1     0   12345   3000 0                   0 S init
+root           500     1   20000   8000 0                   0 S adbd
+shell          600   500   10000   1500 0                   0 S sh
+shell          700   600  900000  60000 0                   0 S app_process
+shell          800   500   10000   1400 0                   0 S sh
+shell          801   800   10000   2000 0                   0 R ps
+system         900     1 1500000 200000 0                   0 S system_server
+"""
+
+PS_TOOLBOX = """USER     PID   PPID  VSIZE  RSS     WCHAN    PC        NAME
+root      1     0     8904   788   ffffffff 00000000 S /init
+root      250   1     10560  700   ffffffff 00000000 S /sbin/adbd
+shell     950   250   9148   1200  ffffffff 00000000 S logcat
+shell     900   250   9148   300   ffffffff 00000000 S /system/bin/sh
+shell     901   900   9148   900   00000000 b6f0c2d4 R ps
+"""
+
 def responder(args):
     if args == ["exec-out", "getprop"]:
         return 0, PROPS_POS, ""
+    if args == ["exec-out", "ps", "-A"]:
+        return 0, PS_TOYBOX, ""
     if args[:3] == ["exec-out", "dumpsys", "battery"]:
         return 0, BATERIA, ""
     if args[:2] == ["exec-out", "wm"]:
@@ -104,6 +124,53 @@ def correr():
             "las propiedades se piden de una vez, no una por campo")
     r.check(all(c[0] == "exec-out" for c, _ in adb.comandos),
             "el panel sólo lee, no escribe nada en el equipo")
+
+    r.check(T.ram_de_adb(PS_TOYBOX) == 8000 + 1500 + 60000,
+            "la RAM de adb suma adbd y todo lo que cuelga de él (scrcpy incluido), "
+            "sin nuestro propio ps ni el sh que lo lanza")
+    r.check(T.ram_de_adb(PS_TOOLBOX) == 700 + 1200,
+            "y entiende el ps antiguo de Android 7 (columna de estado sin título)")
+    r.check(T.ram_de_adb("") is None and T.ram_de_adb("no es ps\n1 2 3") is None
+            and T.ram_de_adb(PS_TOYBOX.replace("adbd", "otro")) is None,
+            "sin adbd a la vista no se inventa una cifra")
+    r.check(v["RAM de adb"] == "68 MB   (7.2 % de la RAM)",
+            "la RAM de adb se da en MB y en porcentaje: " + v["RAM de adb"])
+    tramo = app.info_partes["RAM"]
+    sitio = tramo.place_info()
+    r.check(tramo.winfo_manager() == "place"
+            and abs(float(sitio["relx"]) - (1 - 314572 / 968264.0)) < 1e-3
+            and abs(float(sitio["relwidth"]) - 69500 / 968264.0) < 1e-3,
+            "la parte de adb va en azul al final de lo usado de la barra de RAM")
+    r.check(tramo.cget("fg_color") == T.COLOR_ACCENT,
+            "y en el mismo azul que el rótulo «RAM de adb», que hace de leyenda")
+
+    poner_adb(app, lambda a: (0, PS_TOOLBOX.splitlines()[0] + "\n", "")
+              if a == ["exec-out", "ps", "-A"] else
+              (0, PS_TOOLBOX, "") if a == ["exec-out", "ps"] else responder(a))
+    app._info_worker()
+    esperar(app)
+    r.check(app.info_labels["RAM de adb"].get().startswith("1.9 MB"),
+            "si ps -A no lista nada (toolbox), se repite con ps a secas")
+
+    poner_adb(app, lambda a: (0, "", "") if a[:2] == ["exec-out", "ps"]
+              else responder(a))
+    app._info_worker()
+    esperar(app)
+    r.check(app.info_labels["RAM de adb"].get() == "no disponible"
+            and not tramo.winfo_manager(),
+            "si no se puede medir, lo dice y la barra queda de un solo color")
+
+    adb = poner_adb(app, responder)
+    app._info_vaciar()
+    app._info_carga = 7
+    app._info_worker(ficha=6)
+    esperar(app, 150)
+    r.check(app.info_labels["Modelo"].get() == "—",
+            "lo que llega de una carga anterior (de otro equipo) se descarta")
+    r.check(not adb.se_mando("dumpsys battery"),
+            "y esa carga deja de preguntar al equipo en cuanto queda vieja")
+    app._info_worker(ficha=7)
+    esperar(app, 150)
 
     for pct, color, nombre in ((0.50, T.COLOR_GREEN, "verde"),
                                (0.75, T.COLOR_AMBER, "ámbar"),
